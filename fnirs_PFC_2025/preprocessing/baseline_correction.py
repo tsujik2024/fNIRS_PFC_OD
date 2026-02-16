@@ -1,103 +1,134 @@
-"""
-Implements baseline subtraction for fNIRS data, using either:
-- A custom baseline DataFrame (user-provided), or
-- The quiet stance period between events 'S1' and 'S2' in the data.
-
-Columns like 'Sample number', 'Event', and 'Time (s)' are ignored.
-"""
-
+import re
 import pandas as pd
+import numpy as np
+import logging
+from scipy import stats
+
+logger = logging.getLogger(__name__)
 
 def baseline_subtraction(
-    df: pd.DataFrame,
-    events_df: pd.DataFrame,
-    baseline_df: pd.DataFrame = None
+        df: pd.DataFrame,
+        events_df: pd.DataFrame,
+        baseline_type: str = "long_walk"  # "long_walk", "event_based" (aka S1→S2), or "lshape_task"
 ) -> pd.DataFrame:
     """
-    Applies baseline subtraction to the given DataFrame of fNIRS signals.
+    Baseline-subtract fNIRS signals using trimmed mean (10% each tail).
+    Supports:
+      - "long_walk":      S1 → W1   (fallback: S1 → S2 if W1 missing)
+      - "event_based":    S1 → S2
+      - "lshape_task":    use explicit 'BaselineStart'/'BaselineEnd' provided by caller
+    If 'BaselineStart'/'BaselineEnd' are present in events_df, they take precedence.
 
-    If a `baseline_df` is provided, the baseline mean is computed from that DataFrame
-    (for each channel) and subtracted from `df`. Otherwise, the baseline is computed
-    from the time interval between events 'S1' and 'S2' in `df`.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame containing fNIRS data (columns for channels), plus any metadata
-        columns like 'Sample number', 'Event', 'Time (s)' that should be ignored.
-    events_df : pd.DataFrame
-        DataFrame specifying at least three events (S1, S2, S3). If no `baseline_df`
-        is provided, this script looks for 'S1' and 'S2' to define the baseline period.
-        Must have columns:
-          - 'Sample number'
-          - 'Event'
-    baseline_df : pd.DataFrame, optional
-        If provided, each channel's baseline mean is computed from this DataFrame
-        instead of from S1->S2 in `df`. Must have the same column names as `df`.
-        Default is None.
-
-    Returns
-    -------
-    corrected_df : pd.DataFrame
-        A new DataFrame with the baseline-subtracted signals.
-
-    Raises
-    ------
-    ValueError
-        If the required events ('S1', 'S2') are not found,
-        or if their sample indices are out of range,
-        or if `events_df` does not have exactly 3 events and no custom baseline is provided.
+    Notes:
+      - Only HbO/O2Hb and HbR/HHb channel columns are baseline-subtracted.
+      - Sample numbers are treated as **indices** (0-based), end is **exclusive**.
     """
-    corrected_df = df.copy()
+    if events_df is None or events_df.empty:
+        raise ValueError("No events dataframe provided for baseline subtraction.")
 
-    # Identify which columns are channels vs. metadata
-    ignore_cols = ['Sample number', 'Event', 'Time (s)']
-    data_cols = [col for col in corrected_df.columns if col not in ignore_cols]
+    # Work on a copy; normalize event labels
+    ev = events_df.copy()
+    if 'Event' not in ev.columns or 'Sample number' not in ev.columns:
+        raise ValueError("events_df must contain 'Event' and 'Sample number' columns.")
 
-    if baseline_df is not None:
-        # ------------------------------
-        # Use the provided baseline_df
-        # ------------------------------
-        for ch in data_cols:
-            baseline_mean = baseline_df[ch].mean()
-            corrected_df[ch] = corrected_df[ch] - baseline_mean
+    # Clean event labels and sample numbers
+    ev['Event'] = ev['Event'].astype(str).str.strip().str.upper()
+    ev['Sample number'] = pd.to_numeric(ev['Sample number'], errors='coerce')
+    ev = ev.dropna(subset=['Sample number'])
+    ev['Sample number'] = ev['Sample number'].astype(int)
 
+    # Keep only events that fall on or within the data range
+    n = len(df)
+    ev = ev[(ev['Sample number'] >= 0) & (ev['Sample number'] <= n)]
+    if ev.empty:
+        raise ValueError("All event markers are out of bounds for the data length.")
+
+    # Prefer explicit BaselineStart/BaselineEnd if present (e.g., L-Shape flow)
+    if set(['BASELINESTART', 'BASELINEEND']).issubset(set(ev['Event'])):
+        start = int(ev.loc[ev['Event'] == 'BASELINESTART', 'Sample number'].iloc[0])
+        end   = int(ev.loc[ev['Event'] == 'BASELINEEND',   'Sample number'].iloc[0])
+        label = "BaselineStart→BaselineEnd"
     else:
-        # ---------------------------------------------------
-        # Compute baseline from quiet stance (S1 -> S2) in df
-        # ---------------------------------------------------
-        if len(events_df) != 3:
-            raise ValueError(
-                f"The number of events in events_df is {len(events_df)}, expected 3. "
-                "When no custom baseline_df is provided, we need exactly three events, "
-                "with S1 and S2 defining the baseline window."
-            )
+        # Map baseline mode to required end marker
+        mode = baseline_type.lower().strip()
+        if mode not in ("long_walk", "event_based", "stop_signal", "lshape_task"):
+            logger.warning(f"Unknown baseline_type '{baseline_type}', defaulting to 'event_based' (S1→S2).")
+            mode = "event_based"
 
-        # Extract sample numbers for S1 and S2
-        if 'S1' not in events_df['Event'].values or 'S2' not in events_df['Event'].values:
-            raise ValueError("Events 'S1' and/or 'S2' are missing from events_df.")
+        # Normalize aliases (if present)
+        alias_map = {"BASELINESTART": "S1"}
+        if mode == "long_walk":
+            alias_map["BASELINEEND"] = "W1"
+        else:
+            alias_map["BASELINEEND"] = "S2"
+        ev['Event'] = ev['Event'].replace(alias_map)
 
-        s1_sample = events_df.loc[events_df['Event'] == 'S1', 'Sample number'].values[0]
-        s2_sample = events_df.loc[events_df['Event'] == 'S2', 'Sample number'].values[0]
+        # Must have S1
+        if 'S1' not in set(ev['Event']):
+            raise ValueError("Missing required 'S1' event for baseline estimation.")
 
-        start = int(s1_sample)
-        end = int(s2_sample)
+        s1_idx = int(ev.loc[ev['Event'] == 'S1', 'Sample number'].iloc[0])
 
-        # Check if 'start' and 'end' are within bounds
-        if not (0 <= start < len(corrected_df)) or not (0 < end <= len(corrected_df)):
-            raise ValueError(
-                f"Event indices out of bounds: start={start}, end={end}, "
-                f"data length={len(corrected_df)}"
-            )
-        if start >= end:
-            raise ValueError(
-                f"The baseline interval is invalid: S1={start} >= S2={end}."
-            )
+        if mode == "long_walk":
+            # Prefer W1 *after* S1; if none, allow S2 after S1
+            candidates = ev[(ev['Sample number'] > s1_idx) & (ev['Event'] == 'W1')]
+            if candidates.empty:
+                logger.warning("W1 not found after S1; falling back to S2 after S1 for long_walk baseline.")
+                candidates = ev[(ev['Sample number'] > s1_idx) & (ev['Event'] == 'S2')]
+            if candidates.empty:
+                raise ValueError("Missing end marker (W1/S2) after S1 for long_walk baseline.")
+            end_idx = int(candidates.sort_values('Sample number').iloc[0]['Sample number'])
+            start, end, label = s1_idx, end_idx, "S1→W1"
+        else:
+            # event_based / stop_signal: S1 → S2 (S2 must be after S1)
+            candidates = ev[(ev['Sample number'] > s1_idx) & (ev['Event'] == 'S2')]
+            if candidates.empty:
+                raise ValueError("Missing 'S2' after 'S1' for event_based baseline.")
+            end_idx = int(candidates.sort_values('Sample number').iloc[0]['Sample number'])
+            start, end, label = s1_idx, end_idx, "S1→S2"
 
-        # Subtract the mean during the baseline period
-        for ch in data_cols:
-            baseline_segment = corrected_df.loc[start:end, ch]
-            baseline_mean = baseline_segment.mean()
-            corrected_df[ch] = corrected_df[ch] - baseline_mean
+    # Validate window (end is exclusive)
+    if not (0 <= start < n):
+        raise ValueError(f"S1/BaselineStart sample {start} out of bounds (0..{n-1}).")
+    if not (0 < end <= n):
+        raise ValueError(f"End sample {end} out of bounds (1..{n}).")
+    if start >= end:
+        raise ValueError(f"Invalid baseline window: start ({start}) ≥ end ({end}).")
 
-    return corrected_df
+    # Identify only signal columns to correct (HbO/O2Hb & HbR/HHb)
+    ch_pat = re.compile(r'^CH\d+\s+(HbO|O2Hb|HHb|HbR)$')
+    signal_cols = [c for c in df.columns if ch_pat.match(str(c))]
+    if not signal_cols:
+        logger.warning("No HbO/HbR channel columns found; returning input unchanged.")
+        return df.copy()
+
+    # Compute trimmed-mean baseline per channel (drop NaNs)
+    corrected = df.copy()
+    baseline_slice = slice(start, end)  # end is exclusive
+    win_len = end - start
+
+    logger.info(
+        f"Applying {label} baseline correction with trimmed mean "
+        f"(samples {start}–{end-1}, n={win_len}, trim 10% tails)."
+    )
+
+    for ch in signal_cols:
+        base_vals = corrected.iloc[baseline_slice][ch].astype(float).dropna()
+        if base_vals.empty:
+            # If baseline window is entirely NaN for this channel, skip correction
+            logger.warning(f"Baseline window is empty/NaN for {ch}; skipping baseline subtraction for this channel.")
+            continue
+
+        # Guard for tiny windows: trim_mean handles small n (trimming may be 0)
+        trimmed_mean = stats.trim_mean(base_vals, proportiontocut=0.10)
+        if not np.isfinite(trimmed_mean):
+            # Fallback to simple mean if trimming produced non-finite value
+            trimmed_mean = float(base_vals.mean())
+
+        corrected[ch] = corrected[ch].astype(float) - trimmed_mean
+
+        # Optional debug
+        # regular_mean = float(base_vals.mean())
+        # logger.debug(f"{ch}: mean={regular_mean:.6f}, trimmed={trimmed_mean:.6f}")
+
+    return corrected
