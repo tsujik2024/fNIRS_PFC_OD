@@ -2,228 +2,362 @@ import os
 import pandas as pd
 import numpy as np
 import logging
-from typing import List, Dict, Optional, Union
-from fnirs_PFC_2025.read.loaders import read_txt_file
+from typing import List, Dict, Optional, Union, Tuple
 
 logger = logging.getLogger(__name__)
 
 
 class StatsCollector:
     """
-    Enhanced StatsCollector for multi-task fNIRS data with robust CV filtering support.
+    FIXED StatsCollector - properly extracts timepoint from folder structure (Pre/Post folders)
+    and correctly handles both single-batch and dual-batch output directory structures.
     """
 
     def __init__(self, fs: float = 50.0):
         self.fs = fs
-        logger.info("Enhanced StatsCollector initialized for multi-task processing with robust CV filtering support")
+        logger.info("FIXED StatsCollector initialized - will properly extract timepoint from folder structure")
 
     def run_statistics(self,
                        processed_files: List[str],
                        input_base_dir: str,
-                       output_base_dir: str) -> pd.DataFrame:
-        """Run stats pipeline on all processed files and return combined DataFrame."""
+                       output_base_dir: str,
+                       file_type: str = "RAW") -> pd.DataFrame:
+        """
+        Run stats pipeline on processed files and return combined DataFrame.
+
+        Args:
+            file_type: "RAW" for raw concentrations or "ZSCORE" for Z-scored data
+        """
         all_stats = []
 
-        logger.info(f"🔍 Processing statistics for {len(processed_files)} files")
+        # Track what we've already processed to prevent ANY duplicates
+        processed_stat_signatures = set()
 
-        for file_path in processed_files:
-            # Enhanced metadata extraction
-            subject, timepoint, condition, task_type = self._extract_enhanced_metadata(file_path)
+        # Deduplicate input files by full path
+        unique_processed_files = sorted(set(processed_files))
 
-            # Load the corresponding processed file (handles both CV filtering variants)
-            processed_df = self._load_processed_file_enhanced(
-                file_path, input_base_dir, output_base_dir, task_type
+        if len(unique_processed_files) < len(processed_files):
+            duplicates_removed = len(processed_files) - len(unique_processed_files)
+            logger.warning(f" Removed {duplicates_removed} duplicate input file paths")
+
+        logger.info(f" Processing {file_type} statistics for {len(unique_processed_files)} UNIQUE input files")
+        logger.info(f"   Will look for processed versions in: {output_base_dir}")
+
+        for file_path in unique_processed_files:
+            # FIXED: Extract metadata properly from file path
+            subject, timepoint = self._extract_metadata_from_path(file_path)
+
+            logger.info(f" Processing input file: {os.path.basename(file_path)}")
+            logger.info(f"   Subject: {subject}, Timepoint: {timepoint}")
+
+            # Find matching processed files of the specified type
+            all_processed_dfs = self._load_all_processed_files(
+                file_path, input_base_dir, output_base_dir, file_type=file_type
             )
 
-            if processed_df is None:
-                logger.warning(f" Skipping stats for {os.path.basename(file_path)} - no processed file found")
+            if not all_processed_dfs:
+                logger.warning(
+                    f" Skipping stats for {os.path.basename(file_path)} - no {file_type} processed files found")
                 continue
 
-            # Calculate statistics
-            stats = self._calculate_file_statistics(processed_df, subject, timepoint, condition, task_type)
-            if stats is not None:
-                all_stats.append(stats)
-                logger.info(f" Stats calculated for {subject} {timepoint} {condition}")
+            logger.info(f"   Found {len(all_processed_dfs)} {file_type} processed file version(s)")
+
+            # Calculate statistics for EACH processed file version
+            for idx, (processed_df, batch_type) in enumerate(all_processed_dfs, 1):
+                logger.info(f"   Processing version {idx}/{len(all_processed_dfs)}: {batch_type}")
+
+                # Calculate stats using the timepoint from the PATH (not from the file)
+                stats = self._calculate_file_statistics(
+                    processed_df, subject, timepoint, batch_type
+                )
+
+                if stats is not None:
+                    # Create a comprehensive signature to detect duplicates
+                    stat_signature = (
+                        stats['Subject'],
+                        stats['Timepoint'],
+                        stats['Condition'],
+                        stats['TaskType'],
+                        stats['SQI_Filtering_Applied'],
+                        round(stats['Overall grand oxy Mean'], 10),
+                        round(stats['Overall grand deoxy Mean'], 10)
+                    )
+
+                    if stat_signature in processed_stat_signatures:
+                        logger.warning(f"       DUPLICATE DETECTED - SKIPPING")
+                        logger.warning(f"         Signature: {stat_signature}")
+                        continue
+
+                    processed_stat_signatures.add(stat_signature)
+                    all_stats.append(stats)
+                    logger.info(
+                        f"       Stats added: {stats['Timepoint']} - {stats['Condition']} (SQI: {stats['SQI_Filtering_Applied']})")
+                else:
+                    logger.warning(f"       Stats calculation returned None")
 
         if all_stats:
-            logger.info(f" Successfully calculated statistics for {len(all_stats)} files")
+            logger.info(f" Successfully calculated {file_type} statistics for {len(all_stats)} UNIQUE file versions")
+            logger.info(f"   From {len(unique_processed_files)} input files")
         else:
-            logger.warning(" No statistics were calculated!")
+            logger.warning(f" No {file_type} statistics were calculated!")
 
         return self._create_stats_dataframe(all_stats)
 
-    def _extract_enhanced_metadata(self, file_path: str) -> tuple:
-        """Enhanced metadata extraction for multi-task support with improved CV filtering detection."""
+    def _extract_metadata_from_path(self, file_path: str) -> Tuple[str, str]:
+        """
+        Extract subject and timepoint from file path structure.
+
+        Handles multiple project conventions:
+          1. Timepoint as subfolder:   .../OHSU_Turn_001/Pre/file.txt
+          2. Timepoint in folder name: .../Long_058_V1/file.txt  (split on last _Vn)
+          3. Timepoint in folder name: .../AUT_042_Pre/file.txt  (split on last _Pre/_Post)
+        """
         path_parts = file_path.split(os.sep)
-        file_basename = os.path.basename(file_path)
 
-        # Extract subject
         subject = "Unknown"
-        for part in path_parts:
-            if "OHSU_Turn" in part or any(x in part for x in ["Subject", "subj", "sub-"]):
-                subject = part
-                break
-
-        # Extract timepoint
         timepoint = "Unknown"
-        for part in path_parts:
-            if part.lower() in ["baseline", "pre", "post"] or part in ["Baseline", "Pre", "Post"]:
-                timepoint = part
-                break
 
-        # Enhanced task type detection with improved CV filtering status
-        task_type = "Unknown"
-        condition = "Unknown"
-        cv_filtering_applied = False
+        # ── Strategy 1: Timepoint is its own subfolder (Pre/Post/Baseline) ──
+        for i, part in enumerate(path_parts):
+            part_lower = part.lower()
+            if part_lower in ('pre', 'baseline', 'post', 'post-intervention'):
+                timepoint = "Pre" if part_lower in ('pre', 'baseline') else "Post"
+                if i > 0:
+                    subject = path_parts[i - 1]
+                logger.debug(f"Strategy 1 (subfolder): Subject={subject}, Timepoint={timepoint}")
+                return subject, timepoint
 
-        filename_upper = file_basename.upper()
+        # ── Strategy 2: Timepoint embedded in a folder name ──
+        # Look for patterns like Long_058_V1, AUT_042_Pre, Subject001_Post
+        # Search from deepest directory upward (closest to the file first)
+        dir_path = os.path.dirname(file_path)
+        dir_parts = dir_path.split(os.sep)
 
-        # IMPROVED: More comprehensive CV filtering detection
-        path_str = "/".join(path_parts).upper()
-
-        # Look for CV filtering indicators (comprehensive check)
-        cv_filtering_indicators = [
-            "WITH_CV_FILTERING", "_WITH_CV_FILTERING",
-            "CV_FILTERING", "CVFILTERING",
-            "_CV_FILTERED", "CV_FILTERED",
-            "WITH_CV", "_WITH_CV"
+        import re
+        # Patterns to match timepoint suffixes at the end of a folder name
+        timepoint_patterns = [
+            # _V1, _V2, _V3 etc. — visit numbers
+            (r'^(.+?)_(V\d+)$', None),
+            # _Pre, _Post, _Baseline (case-insensitive)
+            (r'^(.+?)_(Pre|Post|Baseline|Post-Intervention)$', {
+                'pre': 'Pre', 'baseline': 'Pre',
+                'post': 'Post', 'post-intervention': 'Post'
+            }),
+            # _T1, _T2, _T3 etc. — timepoint numbers
+            (r'^(.+?)_(T\d+)$', None),
         ]
 
-        no_cv_indicators = [
-            "WITHOUT_CV_FILTERING", "_WITHOUT_CV_FILTERING",
-            "NO_CV_FILTERING", "NOCVFILTERING",
-            "_ALL_CHANNELS", "ALL_CHANNELS",
-            "WITHOUT_CV", "_WITHOUT_CV"
-        ]
+        for part in reversed(dir_parts):
+            for pattern, mapping in timepoint_patterns:
+                match = re.match(pattern, part, re.IGNORECASE)
+                if match:
+                    subject = match.group(1)
+                    raw_timepoint = match.group(2)
 
-        # Check path for CV filtering status (more reliable than filename alone)
-        if any(indicator in path_str for indicator in cv_filtering_indicators):
-            cv_filtering_applied = True
-            logger.debug(f"CV filtering detected in path: {path_str}")
-        elif any(indicator in path_str for indicator in no_cv_indicators):
-            cv_filtering_applied = False
-            logger.debug(f"No CV filtering detected in path: {path_str}")
-        else:
-            # Fallback: check filename
-            if any(indicator in filename_upper for indicator in cv_filtering_indicators):
-                cv_filtering_applied = True
-                logger.debug(f"CV filtering detected in filename: {filename_upper}")
-            elif any(indicator in filename_upper for indicator in no_cv_indicators):
-                cv_filtering_applied = False
-                logger.debug(f"No CV filtering detected in filename: {filename_upper}")
-            else:
-                # Final fallback: assume no CV filtering if unclear
-                cv_filtering_applied = False
-                logger.debug(f"CV filtering status unclear, defaulting to False for: {file_path}")
+                    if mapping:
+                        timepoint = mapping.get(raw_timepoint.lower(), raw_timepoint)
+                    else:
+                        timepoint = raw_timepoint  # Keep as-is (V1, V2, T1, etc.)
 
-        # Check for specific task types
-        if "FTURN" in filename_upper or "F_TURN" in filename_upper:
-            task_type = "fTurn"
-            base_condition = "EventTask_fTurn"
-        elif "LSHAPE" in filename_upper or "L_SHAPE" in filename_upper:
-            task_type = "LShape"
-            base_condition = "EventTask_LShape"
-        elif "FIGURE8" in filename_upper or "FIG8" in filename_upper:
-            task_type = "Figure8"
-            base_condition = "EventTask_Figure8"
-        elif "OBSTACLE" in filename_upper:
-            task_type = "Obstacle"
-            base_condition = "EventTask_Obstacle"
-        elif "NAVIGATION" in filename_upper or "NAV" in filename_upper:
-            task_type = "Navigation"
-            base_condition = "EventTask_Navigation"
-        elif "DT" in filename_upper:
-            task_type = "DT"
-            base_condition = "LongWalk_DT"
-        elif "ST" in filename_upper:
-            task_type = "ST"
-            base_condition = "LongWalk_ST"
-        elif "WALK" in filename_upper:
-            task_type = "LongWalk"
-            base_condition = "LongWalk_LongWalk"
-        else:
-            base_condition = "Unknown_Unknown"
+                    logger.debug(f"Strategy 2 (embedded): Subject={subject}, Timepoint={timepoint}")
+                    return subject, timepoint
 
-        # Append CV filtering status to condition
-        if cv_filtering_applied:
-            condition = f"{base_condition}_CV_Filtered"
-        else:
-            condition = f"{base_condition}_All_Channels"
+        # ── Strategy 3: Fallback — use parent folder as subject, no timepoint ──
+        if len(dir_parts) >= 1:
+            subject = dir_parts[-1]
+            logger.warning(f"No timepoint detected; using folder as subject: {subject}")
 
-        logger.debug(
-            f"Extracted metadata: {subject}, {timepoint}, {condition}, {task_type}, CV_filtered={cv_filtering_applied}")
-        return subject, timepoint, condition, task_type
+        logger.debug(f"Fallback: Subject={subject}, Timepoint={timepoint}")
+        return subject, timepoint
 
-    def _load_processed_file_enhanced(self,
-                                      file_path: str,
-                                      input_base_dir: str,
-                                      output_base_dir: str,
-                                      task_type: str) -> Optional[pd.DataFrame]:
-        """Enhanced file loading that handles both CV filtering variants."""
+    def _load_all_processed_files(self,
+                                  file_path: str,
+                                  input_base_dir: str,
+                                  output_base_dir: str,
+                                  file_type: str = "RAW") -> List[Tuple[pd.DataFrame, str]]:
+        """
+        Load processed file versions using the SAME path logic as file_processor._create_output_dir.
+
+        FIXED: Correctly handles both single-batch mode (files directly in output_base_dir)
+        and dual-batch mode (files in batch_with_SQI_filtering / batch_no_SQI_filtering subdirs).
+
+        Args:
+            file_path: Original input file path
+            input_base_dir: Base directory of input files
+            output_base_dir: Base directory of output files (may be a batch-specific dir)
+            file_type: "RAW" for raw concentrations or "ZSCORE" for Z-scored data
+        """
         try:
-            # Get the relative path structure from input to preserve folder hierarchy
-            relative_path = os.path.relpath(os.path.dirname(file_path), input_base_dir)
             file_basename = os.path.basename(file_path)
+            base_name_without_ext = file_basename.replace('.txt', '').replace('_OD', '')
 
-            # Try both CV filtering variants
-            cv_variants = [
-                ("_with_CV_filtering", "_with_CV_filtering"),
-                ("_without_CV_filtering", "_without_CV_filtering"),
-                ("", "")  # Fallback for files without CV filtering suffix
-            ]
+            subject, timepoint = self._extract_metadata_from_path(file_path)
 
-            for folder_suffix, file_suffix in cv_variants:
-                # Construct expected output path
-                expected_processed_file = os.path.join(
-                    output_base_dir,
-                    relative_path,
-                    f"{task_type}{folder_suffix}",
-                    f"{file_basename}_FULLY_PROCESSED{file_suffix}.csv"
-                )
+            logger.info(f" Searching for {file_type} versions of: {base_name_without_ext}")
+            logger.info(f"   Subject: {subject}, Timepoint: {timepoint}")
 
-                logger.debug(f"🔍 Looking for processed file: {expected_processed_file}")
+            # FIXED: Determine search directories based on what actually exists.
+            # In dual-batch mode, output_base_dir might be a batch-specific dir already,
+            # or it might be the parent dir containing batch subdirs.
+            # In single-batch mode, files are directly in output_base_dir.
+            batch_dirs = []
 
-                if os.path.exists(expected_processed_file):
-                    logger.debug(f" Found: {expected_processed_file}")
-                    df = pd.read_csv(expected_processed_file)
+            if "batch_with_SQI_filtering" in output_base_dir or "batch_no_SQI_filtering" in output_base_dir:
+                # output_base_dir is already a batch-specific directory
+                batch_dirs = [output_base_dir]
+            else:
+                # Check if batch subdirectories exist (dual-batch mode)
+                batch_with_dir = os.path.join(output_base_dir, "batch_with_SQI_filtering")
+                batch_no_dir = os.path.join(output_base_dir, "batch_no_SQI_filtering")
 
-                    # Verify required columns
-                    required_columns = {'grand oxy', 'grand deoxy', 'Time (s)'}
-                    if not required_columns.issubset(df.columns):
-                        missing = required_columns - set(df.columns)
-                        logger.warning(f" Missing columns {missing} in {expected_processed_file}")
-                        continue
+                if os.path.exists(batch_with_dir) or os.path.exists(batch_no_dir):
+                    # Dual-batch mode: search in batch subdirectories
+                    batch_dirs = [batch_with_dir, batch_no_dir]
+                else:
+                    # FIXED: Single-batch mode: search directly in output_base_dir
+                    batch_dirs = [output_base_dir]
+                    logger.info(f"   Single-batch mode: searching directly in {output_base_dir}")
 
-                    return df
+            # Determine file pattern
+            if file_type == "RAW":
+                search_pattern = "FULLY_PROCESSED_RAW"
+            elif file_type == "ZSCORE":
+                search_pattern = "FULLY_PROCESSED_ZSCORE"
+            else:
+                logger.error(f"Unknown file_type: {file_type}")
+                return []
 
-                # Fallback: search for the file in the task type directory
-                task_dir = os.path.join(output_base_dir, relative_path, f"{task_type}{folder_suffix}")
-                if os.path.exists(task_dir):
-                    logger.debug(f"🔍 Searching in directory: {task_dir}")
-                    for filename in os.listdir(task_dir):
-                        if filename.endswith("_FULLY_PROCESSED.csv") and file_basename.replace('.txt', '') in filename:
-                            fallback_file = os.path.join(task_dir, filename)
-                            logger.info(f" Found fallback file: {fallback_file}")
-                            return pd.read_csv(fallback_file)
+            # Reconstruct the output directory using the SAME logic
+            # as file_processor._create_output_dir
+            relative_path = os.path.relpath(os.path.dirname(file_path), start=input_base_dir)
+            logger.info(f"   Relative path from input base: {relative_path}")
 
-            logger.warning(f" No processed file found for: {file_basename}")
-            return None
+            found_files_by_batch = {}
+
+            for batch_dir in batch_dirs:
+                if not os.path.exists(batch_dir):
+                    logger.warning(f"    Directory does not exist: {batch_dir}")
+                    continue
+
+                # Determine batch type from directory name
+                batch_dir_basename = os.path.basename(batch_dir)
+                if "with_SQI" in batch_dir_basename:
+                    batch_type = "SQI_Filtered"
+                elif "no_SQI" in batch_dir_basename or "without_SQI" in batch_dir_basename:
+                    batch_type = "All_Channels"
+                else:
+                    # Single-batch mode: determine from file content later,
+                    # default to All_Channels
+                    batch_type = "All_Channels"
+
+                logger.info(f"    Searching in: {batch_dir_basename} (Type: {batch_type})")
+
+                if batch_type in found_files_by_batch:
+                    logger.warning(f"       Already have a file for {batch_type}, skipping")
+                    continue
+
+                # Use relpath to find the exact output directory
+                expected_dir = os.path.join(batch_dir, relative_path)
+
+                if not os.path.exists(expected_dir):
+                    logger.warning(f"       Expected directory does not exist: {expected_dir}")
+                    continue
+
+                logger.info(f"       Looking in: {expected_dir}")
+
+                # Walk the expected directory and subdirectories (task type folders)
+                file_found = False
+                for root, dirs, files in os.walk(expected_dir):
+                    if file_found:
+                        break
+
+                    for filename in files:
+                        if (search_pattern in filename
+                                and filename.endswith(".csv")
+                                and base_name_without_ext in filename):
+
+                            full_path = os.path.join(root, filename)
+                            logger.info(f"       FOUND {file_type} FILE: {filename}")
+                            logger.info(f"         Full path: {full_path}")
+
+                            try:
+                                df = pd.read_csv(full_path)
+
+                                required_columns = {'grand oxy', 'grand deoxy', 'Time (s)'}
+                                if not required_columns.issubset(df.columns):
+                                    missing = required_columns - set(df.columns)
+                                    logger.warning(f"          Missing columns {missing}")
+                                    continue
+
+                                if df.empty:
+                                    logger.warning(f"          File is empty (0 rows): {filename}")
+                                    continue
+
+                                # FIXED: In single-batch mode, detect SQI status from file content
+                                actual_batch_type = batch_type
+                                if 'SQI_Filtering_Applied' in df.columns:
+                                    sqi_applied = df['SQI_Filtering_Applied'].iloc[0]
+                                    if sqi_applied:
+                                        actual_batch_type = "SQI_Filtered"
+                                    else:
+                                        actual_batch_type = "All_Channels"
+
+                                found_files_by_batch[actual_batch_type] = (df, full_path)
+                                logger.info(
+                                    f"          LOADED: {actual_batch_type} {file_type} version ({len(df)} rows)")
+                                file_found = True
+                                break
+
+                            except Exception as e:
+                                logger.error(f"          Error reading: {str(e)}")
+                                continue
+
+                    if not file_found:
+                        # Log what files ARE in the directory for debugging
+                        all_csvs = [f for f in files if f.endswith('.csv')]
+                        if all_csvs:
+                            logger.warning(
+                                f"       No match found. CSVs present in {os.path.basename(root)}: {all_csvs[:5]}")
+
+                if not file_found:
+                    logger.warning(f"       No matching {file_type} file found under {expected_dir}")
+
+            # Convert to list format
+            found_files = [(df, batch_type) for batch_type, (df, path) in found_files_by_batch.items()]
+
+            logger.info(f" Total loaded {file_type} file versions: {len(found_files)}")
+
+            if not found_files:
+                logger.error(f" No processed {file_type} files found for {base_name_without_ext}")
+                logger.error(f"   Searched relative path: {relative_path}")
+                logger.error(f"   Search pattern: {search_pattern}")
+                logger.error(f"   In dirs: {[os.path.basename(d) for d in batch_dirs]}")
+
+            return found_files
 
         except Exception as e:
-            logger.error(f" Error loading processed file for {file_path}: {str(e)}", exc_info=True)
-            return None
+            logger.error(f" Error loading processed files for {file_path}: {str(e)}", exc_info=True)
+            return []
 
     def _calculate_file_statistics(self,
                                    processed_df: pd.DataFrame,
                                    subject: str,
                                    timepoint: str,
-                                   condition: str,
-                                   task_type: str) -> Optional[Dict[str, Union[str, float]]]:
-        """Calculate statistics for a single processed file with ROBUST CV filtering detection."""
+                                   batch_type: str) -> Optional[Dict[str, Union[str, float]]]:
+        """
+        FIXED: Calculate statistics using timepoint from PATH, other metadata from FILE.
+
+        Args:
+            processed_df: The processed dataframe
+            subject: Subject ID from path
+            timepoint: Timepoint (Pre/Post) from path - THIS IS CRITICAL
+            batch_type: SQI_Filtered or All_Channels
+        """
         try:
-            required_cols = {'grand oxy', 'grand deoxy'}
+            required_cols = {'grand oxy', 'grand deoxy', 'Time (s)'}
             if not required_cols.issubset(processed_df.columns):
-                logger.warning(f"Missing required columns {required_cols - set(processed_df.columns)} for {subject}")
+                missing = required_cols - set(processed_df.columns)
+                logger.warning(f"Missing required columns {missing} for {subject}")
                 return None
 
             if len(processed_df) == 0:
@@ -232,109 +366,52 @@ class StatsCollector:
 
             total_samples = len(processed_df)
 
-            # ROBUST CV FILTERING STATUS DETECTION (Multiple methods)
-            cv_filtering_applied = False
+            # Get condition and task type from the processed file
+            actual_condition = processed_df['Condition'].iloc[0] if 'Condition' in processed_df.columns else "Unknown"
+            actual_task_type = processed_df['TaskType'].iloc[0] if 'TaskType' in processed_df.columns else "Unknown"
 
-            # Method 1: Read directly from CSV column (most reliable)
-            if 'CV_Filtering_Applied' in processed_df.columns:
-                cv_value = processed_df['CV_Filtering_Applied'].iloc[0]
-                if isinstance(cv_value, (bool, np.bool_)):
-                    cv_filtering_applied = bool(cv_value)
-                elif isinstance(cv_value, str):
-                    cv_filtering_applied = cv_value.lower() in ['true', '1', 'yes', 'on']
-                else:
-                    cv_filtering_applied = bool(cv_value)
-                logger.debug(f"CV filtering status from CSV column: {cv_filtering_applied}")
+            # Determine SQI filtering status from batch type
+            sqi_filtering_applied = (batch_type == "SQI_Filtered")
 
-            # Method 2: Infer from condition name as fallback
-            elif "CV_Filtered" in condition:
-                cv_filtering_applied = True
-                logger.debug(f"CV filtering status inferred from condition '{condition}': True")
+            # CRITICAL: Use the timepoint from the PATH, not from the file
+            logger.info(f" Calculating statistics:")
+            logger.info(f"   Subject: {subject}")
+            logger.info(f"   Timepoint (from path): {timepoint}")
+            logger.info(f"   Condition: {actual_condition}")
+            logger.info(f"   Task Type: {actual_task_type}")
+            logger.info(f"   SQI Filtering: {sqi_filtering_applied}")
 
-            elif "All_Channels" in condition:
-                cv_filtering_applied = False
-                logger.debug(f"CV filtering status inferred from condition '{condition}': False")
-
-            # Method 3: Check if DataFrame has metadata columns that might indicate CV status
-            elif 'Condition' in processed_df.columns:
-                file_condition = str(processed_df['Condition'].iloc[0])
-                if "CV_Filtered" in file_condition:
-                    cv_filtering_applied = True
-                elif "All_Channels" in file_condition:
-                    cv_filtering_applied = False
-                logger.debug(f"CV filtering status from file condition '{file_condition}': {cv_filtering_applied}")
-
-            else:
-                # Final fallback: default to False with warning
-                cv_filtering_applied = False
-                logger.warning(f" Could not determine CV filtering status for {subject}, defaulting to False")
-
-            # Log the final determination
-            logger.info(f"📊 Final CV filtering status for {subject}: {cv_filtering_applied}")
-
-            # Basic HbO/HbR stats (all task types)
+            # Calculate statistics on RAW concentration values
             oxy_overall = processed_df['grand oxy'].mean(skipna=True)
             deoxy_overall = processed_df['grand deoxy'].mean(skipna=True)
 
+            # Calculate first/second half means
             oxy_first_half = processed_df.iloc[:total_samples // 2]['grand oxy'].mean(skipna=True)
             oxy_second_half = processed_df.iloc[total_samples // 2:]['grand oxy'].mean(skipna=True)
 
             deoxy_first_half = processed_df.iloc[:total_samples // 2]['grand deoxy'].mean(skipna=True)
             deoxy_second_half = processed_df.iloc[total_samples // 2:]['grand deoxy'].mean(skipna=True)
 
-            # Initialize stats dictionary with CORRECTED CV filtering status
+            # Initialize stats dictionary
             stats = {
                 'Subject': subject,
-                'Timepoint': timepoint,
-                'Condition': condition,
-                'TaskType': task_type,
-                'CV_Filtering_Applied': cv_filtering_applied,  # This should now be correct!
-                # HbO
+                'Timepoint': timepoint,  # CRITICAL: Using timepoint from PATH
+                'Condition': actual_condition,
+                'TaskType': actual_task_type,
+                'SQI_Filtering_Applied': sqi_filtering_applied,
+
+                # HbO concentration statistics
                 'Overall grand oxy Mean': oxy_overall,
                 'First Half grand oxy Mean': oxy_first_half,
                 'Second Half grand oxy Mean': oxy_second_half,
-                # HbR
+
+                # HbR concentration statistics
                 'Overall grand deoxy Mean': deoxy_overall,
                 'First Half grand deoxy Mean': deoxy_first_half,
                 'Second Half grand deoxy Mean': deoxy_second_half,
             }
 
-            # Task-specific analysis
-            if task_type in ['DT', 'ST', 'LongWalk']:
-                # Long walk tasks may have TaskPhase column for walking/turning analysis
-                if 'TaskPhase' in processed_df.columns:
-                    walking = processed_df[processed_df['TaskPhase'] == 'Walking']
-                    turning = processed_df[processed_df['TaskPhase'] == 'Turning']
-
-                    if not walking.empty:
-                        stats['Walking grand oxy Mean'] = walking['grand oxy'].mean(skipna=True)
-                        stats['Walking grand deoxy Mean'] = walking['grand deoxy'].mean(skipna=True)
-
-                    if not turning.empty:
-                        stats['Turning grand oxy Mean'] = turning['grand oxy'].mean(skipna=True)
-                        stats['Turning grand deoxy Mean'] = turning['grand deoxy'].mean(skipna=True)
-
-                    # Calculate differences
-                    if pd.notna(stats.get('Walking grand oxy Mean')) and pd.notna(stats.get('Turning grand oxy Mean')):
-                        stats['Δ HbO Turning - Walking'] = (
-                                stats['Turning grand oxy Mean'] - stats['Walking grand oxy Mean']
-                        )
-
-                    if pd.notna(stats.get('Walking grand deoxy Mean')) and pd.notna(
-                            stats.get('Turning grand deoxy Mean')):
-                        stats['Δ HbR Turning - Walking'] = (
-                                stats['Turning grand deoxy Mean'] - stats['Walking grand deoxy Mean']
-                        )
-
-            elif task_type in ['fTurn', 'LShape', 'Figure8', 'Obstacle', 'Navigation']:
-                # Event-dependent tasks - different analysis approach
-                # For now, just use overall means as "task execution" means
-                stats['Task Execution HbO Mean'] = oxy_overall
-                stats['Task Execution HbR Mean'] = deoxy_overall
-
-                # Could add event-based analysis here in the future
-                logger.debug(f"Event-dependent task {task_type} - using overall means for task execution")
-
+            logger.info(f" Stats calculated: {timepoint}, HbO={oxy_overall:.6f}, HbR={deoxy_overall:.6f}")
             return stats
 
         except Exception as e:
@@ -342,48 +419,35 @@ class StatsCollector:
             return None
 
     def create_summary_sheets(self,
-                              combined_stats_df: pd.DataFrame,
+                              combined_stats_df: Optional[pd.DataFrame],
                               output_folder: str,
                               suffix: str = "") -> None:
-        """Create summary sheets for different task types with optional suffix for CV filtering variants."""
+        """Create summary sheets for different task types."""
         try:
-            # Get unique conditions in the data
-            unique_conditions = combined_stats_df['Condition'].unique()
-            logger.info(f"📊 Creating summaries for conditions: {list(unique_conditions)}")
+            # FIXED: Guard against both None and empty DataFrame
+            if combined_stats_df is None or combined_stats_df.empty:
+                logger.warning(f"No statistics data to create summary sheets (suffix={suffix})")
+                return
 
-            # Create summaries for each condition
+            if 'Condition' not in combined_stats_df.columns:
+                logger.warning("No 'Condition' column in stats DataFrame — cannot create summaries")
+                return
+
+            unique_conditions = combined_stats_df['Condition'].unique()
+            logger.info(f" Creating summaries for conditions: {list(unique_conditions)} (suffix={suffix})")
+
             for condition in unique_conditions:
                 summary_df = self._filter_and_format_summary(combined_stats_df, condition)
 
                 if not summary_df.empty:
-                    # Create safe filename with suffix
                     safe_condition = condition.replace('_', '-').replace(' ', '-')
                     summary_filename = f'summary_{safe_condition}{suffix}.csv'
                     summary_path = os.path.join(output_folder, summary_filename)
 
                     summary_df.to_csv(summary_path, index=False)
-                    logger.info(f" Saved summary: {summary_filename}")
+                    logger.info(f" Saved summary ({len(summary_df)} rows): {summary_filename}")
                 else:
                     logger.warning(f" No data for condition: {condition}")
-
-            # Create CV filtering comparison summaries if both variants exist
-            self._create_cv_comparison_summaries(combined_stats_df, output_folder, suffix)
-
-            # Also create traditional ST/DT summaries if they exist
-            st_conditions = [cond for cond in unique_conditions if 'LongWalk_ST' in cond]
-            dt_conditions = [cond for cond in unique_conditions if 'LongWalk_DT' in cond]
-
-            if st_conditions:
-                for st_condition in st_conditions:
-                    summary_ST = self._filter_and_format_summary(combined_stats_df, st_condition)
-                    cv_status = "CV_Filtered" if "CV_Filtered" in st_condition else "All_Channels"
-                    summary_ST.to_csv(os.path.join(output_folder, f'summary_ST_{cv_status}{suffix}.csv'), index=False)
-
-            if dt_conditions:
-                for dt_condition in dt_conditions:
-                    summary_DT = self._filter_and_format_summary(combined_stats_df, dt_condition)
-                    cv_status = "CV_Filtered" if "CV_Filtered" in dt_condition else "All_Channels"
-                    summary_DT.to_csv(os.path.join(output_folder, f'summary_DT_{cv_status}{suffix}.csv'), index=False)
 
             logger.info(" Summary sheets creation completed.")
 
@@ -391,88 +455,24 @@ class StatsCollector:
             logger.error(f"Error creating summary sheets: {str(e)}", exc_info=True)
             raise
 
-    def _create_cv_comparison_summaries(self, combined_stats_df: pd.DataFrame, output_folder: str,
-                                        suffix: str = "") -> None:
-        """Create comparison summaries between CV filtered and non-filtered results."""
-        try:
-            # Check if we have both CV filtered and non-filtered data
-            cv_filtered_data = combined_stats_df[combined_stats_df['CV_Filtering_Applied'] == True]
-            all_channels_data = combined_stats_df[combined_stats_df['CV_Filtering_Applied'] == False]
+    def _create_stats_dataframe(self, all_stats: List[Dict]) -> Optional[pd.DataFrame]:
+        """Convert list of stats dictionaries to DataFrame. Returns None if no stats."""
+        if not all_stats:
+            logger.warning("No statistics collected - returning None")
+            return None
 
-            if not cv_filtered_data.empty and not all_channels_data.empty:
-                logger.info("📊 Creating CV filtering comparison summaries")
+        df = pd.DataFrame(all_stats)
+        logger.info(f" Created stats DataFrame with {len(df)} rows and {len(df.columns)} columns")
 
-                # Get unique task types
-                task_types = combined_stats_df['TaskType'].unique()
+        if 'Timepoint' in df.columns:
+            timepoint_counts = df['Timepoint'].value_counts()
+            logger.info(f" Timepoint distribution: {timepoint_counts.to_dict()}")
 
-                for task_type in task_types:
-                    cv_filtered_task = cv_filtered_data[cv_filtered_data['TaskType'] == task_type]
-                    all_channels_task = all_channels_data[all_channels_data['TaskType'] == task_type]
+        if 'SQI_Filtering_Applied' in df.columns:
+            sqi_counts = df['SQI_Filtering_Applied'].value_counts()
+            logger.info(f" SQI Filtering distribution: {sqi_counts.to_dict()}")
 
-                    if not cv_filtered_task.empty and not all_channels_task.empty:
-                        # Create comparison DataFrame
-                        comparison_data = []
-
-                        # Get common subjects
-                        common_subjects = set(cv_filtered_task['Subject']) & set(all_channels_task['Subject'])
-
-                        for subject in common_subjects:
-                            cv_subject = cv_filtered_task[cv_filtered_task['Subject'] == subject]
-                            all_subject = all_channels_task[all_channels_task['Subject'] == subject]
-
-                            if not cv_subject.empty and not all_subject.empty:
-                                comparison_row = {
-                                    'Subject': subject,
-                                    'TaskType': task_type,
-                                    'HbO_All_Channels': all_subject['Overall grand oxy Mean'].iloc[0],
-                                    'HbO_CV_Filtered': cv_subject['Overall grand oxy Mean'].iloc[0],
-                                    'HbR_All_Channels': all_subject['Overall grand deoxy Mean'].iloc[0],
-                                    'HbR_CV_Filtered': cv_subject['Overall grand deoxy Mean'].iloc[0],
-                                }
-
-                                # Calculate differences
-                                comparison_row['HbO_Difference'] = (
-                                        comparison_row['HbO_CV_Filtered'] - comparison_row['HbO_All_Channels']
-                                )
-                                comparison_row['HbR_Difference'] = (
-                                        comparison_row['HbR_CV_Filtered'] - comparison_row['HbR_All_Channels']
-                                )
-
-                                comparison_data.append(comparison_row)
-
-                        if comparison_data:
-                            comparison_df = pd.DataFrame(comparison_data)
-                            comparison_filename = f'CV_filtering_comparison_{task_type}{suffix}.csv'
-                            comparison_path = os.path.join(output_folder, comparison_filename)
-                            comparison_df.to_csv(comparison_path, index=False)
-                            logger.info(f"✅ Saved CV comparison: {comparison_filename}")
-            else:
-                logger.info(" No CV filtering comparison created - missing one or both CV variants")
-                logger.debug(f"CV filtered data: {len(cv_filtered_data)} rows")
-                logger.debug(f"All channels data: {len(all_channels_data)} rows")
-
-        except Exception as e:
-            logger.error(f"Error creating CV comparison summaries: {str(e)}")
-
-    def _create_stats_dataframe(self, all_stats: List[Dict]) -> pd.DataFrame:
-        """Convert list of stats dictionaries to DataFrame."""
-        if all_stats:
-            df = pd.DataFrame(all_stats)
-            logger.info(f"📊 Created stats DataFrame with {len(df)} rows and {len(df.columns)} columns")
-
-            # Log CV filtering distribution for verification
-            if 'CV_Filtering_Applied' in df.columns:
-                cv_counts = df['CV_Filtering_Applied'].value_counts()
-                logger.info(f"📊 CV Filtering distribution: {cv_counts.to_dict()}")
-
-            return df
-        else:
-            logger.warning("No statistics collected - returning empty DataFrame")
-            return pd.DataFrame(columns=[
-                'Subject', 'Timepoint', 'Condition', 'TaskType', 'CV_Filtering_Applied',
-                'Overall grand oxy Mean', 'First Half grand oxy Mean',
-                'Second Half grand oxy Mean',
-            ])
+        return df
 
     def _filter_and_format_summary(self,
                                    df: pd.DataFrame,
@@ -480,21 +480,18 @@ class StatsCollector:
         """Filter and format summary for a specific condition."""
         filtered = df[df['Condition'] == condition].copy()
 
-        # Select appropriate columns based on what's available
-        base_columns = ['Subject', 'Timepoint', 'TaskType', 'CV_Filtering_Applied', 'Overall grand oxy Mean']
+        if filtered.empty:
+            return filtered
 
-        optional_columns = [
-            'First Half grand oxy Mean',
-            'Second Half grand oxy Mean',
-            'Overall grand deoxy Mean',
-            'Task Execution HbO Mean',
-            'Walking grand oxy Mean',
-            'Turning grand oxy Mean',
-            'Δ HbO Turning - Walking'
+        # Use ONLY the columns that we actually calculate
+        base_columns = [
+            'Subject', 'Timepoint', 'TaskType', 'SQI_Filtering_Applied',
+            'Overall grand oxy Mean', 'First Half grand oxy Mean', 'Second Half grand oxy Mean',
+            'Overall grand deoxy Mean', 'First Half grand deoxy Mean', 'Second Half grand deoxy Mean'
         ]
 
         # Include columns that exist in the data
-        columns_to_include = base_columns + [col for col in optional_columns if col in filtered.columns]
+        columns_to_include = [col for col in base_columns if col in filtered.columns]
 
         return filtered[columns_to_include]
 
@@ -502,33 +499,36 @@ class StatsCollector:
                                    processed_files: List[str],
                                    output_base_dir: str,
                                    input_base_dir: str) -> Dict[str, Dict[str, float]]:
-        """Calculate consistent y-axis limits per subject across all processed files (both CV variants)."""
-        logger.info("🔍 Calculating subject y-limits from processed files (including both CV variants)")
+        """Calculate consistent y-axis limits per subject across all processed files (both SQI variants)."""
+        logger.info("Calculating subject y-limits from processed files (including both SQI variants)")
 
         subject_data = {}
 
         for file_path in processed_files:
             try:
-                subject, timepoint, condition, task_type = self._extract_enhanced_metadata(file_path)
+                # Extract metadata from path
+                subject, timepoint = self._extract_metadata_from_path(file_path)
 
-                # Load the processed file (will try both CV variants)
-                processed_df = self._load_processed_file_enhanced(
-                    file_path, input_base_dir, output_base_dir, task_type
+                # Load the processed files (will try both SQI variants)
+                all_processed_dfs = self._load_all_processed_files(
+                    file_path, input_base_dir, output_base_dir, file_type="RAW"
                 )
 
-                if processed_df is None:
+                if not all_processed_dfs:
                     continue
 
-                # Extract signal values
-                if 'grand oxy' in processed_df.columns and 'grand deoxy' in processed_df.columns:
-                    oxy_values = processed_df['grand oxy'].dropna()
-                    deoxy_values = processed_df['grand deoxy'].dropna()
+                # Process each variant
+                for processed_df, batch_type in all_processed_dfs:
+                    # Extract signal values
+                    if 'grand oxy' in processed_df.columns and 'grand deoxy' in processed_df.columns:
+                        oxy_values = processed_df['grand oxy'].dropna()
+                        deoxy_values = processed_df['grand deoxy'].dropna()
 
-                    if subject not in subject_data:
-                        subject_data[subject] = {'oxy': [], 'deoxy': []}
+                        if subject not in subject_data:
+                            subject_data[subject] = {'oxy': [], 'deoxy': []}
 
-                    subject_data[subject]['oxy'].extend(oxy_values.tolist())
-                    subject_data[subject]['deoxy'].extend(deoxy_values.tolist())
+                        subject_data[subject]['oxy'].extend(oxy_values.tolist())
+                        subject_data[subject]['deoxy'].extend(deoxy_values.tolist())
 
             except Exception as e:
                 logger.warning(f" Error processing {file_path} for y-limits: {e}")
