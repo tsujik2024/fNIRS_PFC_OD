@@ -85,51 +85,42 @@ def scr_regression(long_data: pd.DataFrame, short_data: pd.DataFrame) -> pd.Data
 
 def _find_matching_short(long_ch: str, short_data: pd.DataFrame) -> str:
     """
-    Find and return the short channel for a given long channel using CH{i} naming.
+    Map a long channel to its paired short channel for SCR.
 
-    For prefrontal cap configuration with 0-based indexing (CH0-CH7):
-    - Short channels: CH6 and CH7 (both HbO and HbR)
-    - Mapping:
-        CH0, CH1, CH2 → CH6 (left side)
-        CH3, CH4, CH5 → CH7 (right side)
+    Assumes 0-based channel naming: CH0..CH7
+    True short channels: CH2 and CH6
 
-    Parameters
-    ----------
-    long_ch : str
-        Long channel name in format "CH{i} HbO" or "CH{i} HbR"
-    short_data : pd.DataFrame
-        DataFrame containing short channel data
-
-    Returns
-    -------
-    str
-        Matching short channel name
+    IMPORTANT:
+    - If the incoming channel is itself a short channel (CH2/CH6), we refuse to correct it.
     """
     short_chs = list(short_data.columns)
 
-    # Extract channel number and chromophore from "CH1 HbO" format
-    ch_match = re.match(r'CH(\d+) (HbO|HbR|O2Hb|HHb)', long_ch)
-    if not ch_match:
-        raise KeyError(f"Invalid long channel format: {long_ch}. Expected 'CH{{i}} HbO' or 'CH{{i}} HbR'")
+    m = re.match(r'CH(\d+)\s+(HbO|HbR|O2Hb|HHb)$', str(long_ch))
+    if not m:
+        raise KeyError(f"Invalid channel format: {long_ch}")
 
-    ch_num = int(ch_match.group(1))
-    oxygenation = ch_match.group(2)
+    ch_num = int(m.group(1))
+    chromo = m.group(2)
 
-    # For prefrontal cap with 0-based indexing: CH6 and CH7 are short channels
+    SHORT_IDS = {2, 6}
+    if ch_num in SHORT_IDS:
+        raise KeyError(f"{long_ch} is a short channel (CH2/CH6) and should not be SCR-corrected.")
+
+    # Pick your mapping. You must choose which long channels pair with which short.
+    # If you don't know yet, this is a reasonable starting point:
     channel_mapping = {
-        # Left hemisphere channels → CH6 (short)
-        0: 6, 1: 6, 2: 6,
-        # Right hemisphere channels → CH7 (short)
-        3: 7, 4: 7, 5: 7,
+        0: 6, 1: 6, 3: 6,   # example grouping to CH6
+        4: 2, 5: 2, 7: 2,   # example grouping to CH2
+        # NOTE: you must decide where CH7 belongs if CH7 is a long channel in your setup
     }
 
     target_short_num = channel_mapping.get(ch_num)
-    if not target_short_num:
-        raise KeyError(f"No short channel mapping defined for {long_ch}")
+    if target_short_num is None:
+        raise KeyError(f"No short channel mapping defined for {long_ch} (CH{ch_num}).")
 
-    short_ch_name = f"CH{target_short_num} {oxygenation}"
+    short_ch_name = f"CH{target_short_num} {chromo}"
 
     if short_ch_name not in short_chs:
-        raise KeyError(f"Mapped short channel {short_ch_name} not found in available short channels: {short_chs}")
+        raise KeyError(f"Mapped short channel {short_ch_name} not found. Available: {short_chs}")
 
     return short_ch_name
