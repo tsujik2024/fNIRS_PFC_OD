@@ -78,7 +78,8 @@ def average_channels(
         right_ids = default_right if right_ids is None else list(right_ids)
 
     if short_ids is None:
-        short_ids = [6,7] if zero_based else [7,8]
+        # Project-specific: short channels are CH2 and CH6
+        short_ids = [2, 6]
 
     # Apply excludes
     excludes = set(int(x) for x in (channels_to_exclude or [])) | set(int(x) for x in short_ids)
