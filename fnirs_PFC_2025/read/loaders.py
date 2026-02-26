@@ -2,15 +2,17 @@ import logging
 import pandas as pd
 import numpy as np
 import re
+import collections
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)  # Adjust logging level as needed
 
+
 def read_txt_file(file_path: str) -> dict:
     """
-    Reads an OxySoft .txt export and returns:
-      - 'metadata': parsed header info (+ 'Sample Rate (Hz)')
-      - 'data': cleaned DataFrame with renamed channels 'CH{i} HbO' / 'CH{i} HbR'
+    Reads an OxySoft .txt export with OD data and returns:
+      - 'metadata': parsed header info (+ 'Sample Rate (Hz)', wavelengths)
+      - 'data': cleaned DataFrame with renamed channels in format 'CH{i}_WL{wavelength}'
     """
     try:
         with open(file_path, 'r') as f:
@@ -27,49 +29,134 @@ def read_txt_file(file_path: str) -> dict:
 
     # ---- metadata ----
     metadata = {}
+    wavelengths_parsed = False
+
     try:
-        for i in range(min(7, len(rows))):
+        for i in range(min(50, len(rows))):
             row = rows[i]
-            if not row or len(row) < 2:
+            if not row:
                 continue
-            k = row[0].strip()
-            v = row[1].strip()
+
+            k = row[0].strip() if row[0] else ""
             kl = k.lower()
-            if kl.startswith("start of measurement"):
-                metadata['Measurement Start'] = v
-            elif kl.startswith("record date/time"):
-                metadata['Record Date/Time'] = v
-            elif kl.startswith("export date"):
-                metadata['Export date'] = v
-            elif kl.startswith("subject public id"):
-                metadata['Subject Public ID'] = v
+
+            # Handle rows with key-value pairs
+            if len(row) >= 2:
+                v = row[1].strip()
+
+                if kl.startswith("start of measurement"):
+                    metadata['Measurement Start'] = v
+                elif kl.startswith("record date/time"):
+                    metadata['Record Date/Time'] = v
+                elif kl.startswith("export date"):
+                    metadata['Export date'] = v
+                elif kl.startswith("subject public id"):
+                    metadata['Subject Public ID'] = v
+                elif kl.startswith("export sample rate"):
+                    try:
+                        metadata['Sample Rate (Hz)'] = float(v)
+                    except:
+                        pass
+
+            # Handle wavelength section (single column header)
+            if "light source wavelengths" in kl and not wavelengths_parsed:
+                logger.info(f"Found wavelength header at row {i}: {row}")
+                metadata['Wavelengths'] = {}
+
+                # Skip the header row (device | index | wavelength)
+                # Start parsing from the next row
+                for j in range(i + 2, min(i + 20, len(rows))):  # i+2 to skip both header rows
+                    row_j = rows[j]
+
+                    # Stop if we hit an empty row or new section
+                    if not row_j or (len(row_j) == 1 and row_j[0].strip() == ''):
+                        logger.info(f"Stopped wavelength parsing at row {j} (empty row)")
+                        break
+
+                    # Parse wavelength data: device | index | wavelength | nm
+                    if len(row_j) >= 3:
+                        try:
+                            # row_j[0] = device id (always '1' in your case)
+                            # row_j[1] = light source index (1-16)
+                            # row_j[2] = wavelength (e.g., '846')
+                            # row_j[3] = 'nm' (optional)
+
+                            device_id = row_j[0].strip()
+                            if not device_id.isdigit():
+                                # Not a data row, stop parsing
+                                break
+
+                            src_idx = int(row_j[1].strip())
+                            wavelength = int(row_j[2].strip())
+                            metadata['Wavelengths'][src_idx] = wavelength
+                            logger.debug(f"Parsed: Device {device_id}, LS{src_idx} = {wavelength}nm")
+
+                        except (ValueError, IndexError) as e:
+                            logger.warning(f"Could not parse wavelength row {j}: {row_j} - {e}")
+                            break
+
+                wavelengths_parsed = True
+                logger.info(f"Total wavelengths parsed: {len(metadata.get('Wavelengths', {}))}")
+                logger.info(f"Wavelength map: {metadata.get('Wavelengths', {})}")
+
     except Exception as e:
         logger.warning(f" Metadata parsing error in {file_path}: {e}")
 
+    # Verify wavelengths were found
+    if 'Wavelengths' not in metadata or not metadata['Wavelengths']:
+        logger.error(f"No wavelengths found in metadata for {file_path}")
+        logger.error("This will cause all channels to be UNMAPPED")
+    else:
+        logger.info(f"Successfully parsed {len(metadata['Wavelengths'])} wavelengths")
+
     # sample rate + header row indices
     start_idx = end_idx = None
-    sample_rate = None
+    sample_rate = metadata.get('Sample Rate (Hz)')
+
+    # First pass: find sample rate
     for idx, row in enumerate(rows):
-        if "Datafile sample rate:" in row:
+        if len(row) > 1 and "Datafile sample rate:" in row[0]:
             try:
-                sample_rate = int(float(row[1]))
+                sample_rate = float(row[1])
+                metadata['Sample Rate (Hz)'] = sample_rate
             except Exception:
                 logger.warning(f" Could not parse sample rate in {file_path}")
-        if "(Sample number)" in row:
+
+    # Second pass: find column header rows
+    # Look for rows containing (Sample number) and (Event) markers
+    for idx, row in enumerate(rows):
+        # Convert all cells to strings and check for markers
+        row_str = '\t'.join([str(cell) for cell in row])
+
+        if "(Sample number)" in row_str and start_idx is None:
             start_idx = idx
-        if "(Event)" in row:
+            logger.debug(f"Found (Sample number) marker at row {idx}: {row}")
+
+        if "(Event)" in row_str:
             end_idx = idx
-            break
+            logger.debug(f"Found (Event) marker at row {idx}: {row}")
 
     if start_idx is None or end_idx is None:
         logger.error(f" Could not identify column header rows in {file_path}")
+        logger.error(f" start_idx={start_idx}, end_idx={end_idx}")
+        # Debug output
+        logger.debug("Searching for markers in file. Showing rows 40-70:")
+        for i in range(40, min(70, len(rows))):
+            row_str = '\t'.join([str(cell) for cell in rows[i]])
+            if "(Sample number)" in row_str or "(Event)" in row_str:
+                logger.debug(f"*** Row {i}: {rows[i]}")
+            else:
+                logger.debug(f"Row {i}: {rows[i]}")
         return None
-    metadata['Sample Rate (Hz)'] = sample_rate
+
+    if sample_rate is None:
+        logger.warning(f" Could not determine sample rate for {file_path}")
+
     metadata['Export file'] = file_path
 
     # Subject fallback
     if 'Subject Public ID' not in metadata or not metadata['Subject Public ID']:
-        m = re.search(r'(OHSU[_-]?Turn[_-]?\d+|sub[-_]\w+)', file_path, flags=re.IGNORECASE)
+        m = re.search(r'(OHSU[_-]?Turn[_-]?\d+|Turn[_-]?\d+|sub[-_]\w+)', file_path, flags=re.IGNORECASE)
         metadata['Subject Public ID'] = m.group(1) if m else None
         if metadata['Subject Public ID']:
             logger.warning(f" Inferred Subject ID from filename: {metadata['Subject Public ID']}")
@@ -81,22 +168,29 @@ def read_txt_file(file_path: str) -> dict:
 
     # ---- column labels ----
     try:
-        col_labels = [r[1] for r in rows[start_idx:end_idx+1]]
+        # In OD exports, the column structure spans multiple rows
+        # We need to extract the labels from the appropriate column
+        # Based on the Legend structure, column labels are in column index 1
+        col_labels = []
+        for idx in range(start_idx, end_idx + 1):
+            row = rows[idx]
+            # The column label is typically in index 1
+            if len(row) > 1:
+                col_labels.append(row[1])
+            elif len(row) == 1:
+                col_labels.append(row[0])
+            else:
+                logger.warning(f"Unexpected row structure at {idx}: {row}")
+                col_labels.append("")
+
+        logger.debug(f"Extracted {len(col_labels)} raw column labels: {col_labels}")
+
     except Exception as e:
         logger.error(f" Failed to parse column labels in {file_path}: {e}")
         return None
 
-    for i, label in enumerate(col_labels):
-        # Signals → strip "(...)"
-        if any(tok in label for tok in ("O2Hb", "HHb", "HbO", "HbR")):
-            col_labels[i] = label.split('(')[0].strip()
-        # Sample/Event → pull token in parentheses
-        elif "(Sample number)" in label or "(Event)" in label:
-            parts = label.split('(')
-            if len(parts) == 2:
-                col_labels[i] = parts[1].split(')')[0]
-            else:
-                logger.warning(f" Unexpected label format: {label}")
+    # Process OD column labels
+    col_labels = _process_od_column_labels(col_labels, metadata, file_path)
 
     # ---- data rows ----
     data_rows = rows[end_idx + 4:]
@@ -120,28 +214,191 @@ def read_txt_file(file_path: str) -> dict:
 
     # Convert numeric where possible (preserve Event)
     num_cols = [c for c in df.columns if c != 'Event']
-    df[num_cols] = df[num_cols].apply(pd.to_numeric, errors='coerce')
+
+    logger.debug(f"Attempting to convert {len(num_cols)} columns to numeric")
+
+    # Convert each column individually with extensive error handling
+    for col in num_cols:
+        try:
+            if col not in df.columns:
+                logger.warning(f"Column '{col}' not found in DataFrame")
+                continue
+
+            # Check if the column data is accessible
+            col_data = df[col]
+            logger.debug(
+                f"Processing column '{col}': type = {type(col_data)}, shape = {getattr(col_data, 'shape', 'N/A')}")
+
+            # Ensure we have a Series or convertible object
+            if not isinstance(col_data, (pd.Series, list, tuple, np.ndarray)):
+                logger.warning(f"Column '{col}' is not a Series (type: {type(col_data)}), converting to list")
+                col_data = col_data.tolist() if hasattr(col_data, 'tolist') else list(col_data)
+
+            # Convert to numeric
+            df[col] = pd.to_numeric(col_data, errors='coerce')
+            logger.debug(f"Successfully converted column '{col}' to numeric")
+
+        except Exception as e:
+            logger.error(f"Failed to convert column '{col}' to numeric: {e}")
+            logger.error(
+                f"Column type: {type(df[col])}, Column content sample: {df[col].iloc[:3] if hasattr(df[col], 'iloc') else 'N/A'}")
+            # Keep the column as string if conversion fails
 
     # Clean Event once
     if 'Event' in df.columns:
         df['Event'] = df['Event'].astype(str).str.strip()
         df['Event'] = df['Event'].replace({'': np.nan, 'nan': np.nan})
 
-    # Drop first two rows (OxySoft artifacts) only if there’s room
-    if len(df) > 2:
-        df = df.iloc[2:].reset_index(drop=True)
+    # Drop first two rows (OxySoft artifacts) only if there's room
+    if len(df) > 3:
+        df = df.iloc[3:].reset_index(drop=True)
 
     # Ensure Sample number is int if present
     if 'Sample number' in df.columns:
         df['Sample number'] = pd.to_numeric(df['Sample number'], errors='coerce').fillna(0).astype(int)
 
-    # Final rename to CH{i} HbO/HbR pairs
-    df = _reassign_channels(df, file_path)
+    # Final reorganization of OD columns
+    df = _reassign_channels_od(df, metadata, file_path)
+
     if df is None or df.empty:
         logger.error(f" DataFrame empty after channel reassignment in {file_path}")
         return None
 
     return {'metadata': metadata, 'data': df}
+
+
+def _process_od_column_labels(col_labels, metadata, file_path):
+    """
+    Map raw column labels to:
+      - 'Sample number'
+      - 'ADC'
+      - 'Event'
+      - OD columns in the form 'CH{channel}_WL{wavelength}'
+
+    Using the legend:
+
+      Column 1  -> (Sample number)
+      Columns 2–17 -> Light sources 1–16
+      Column 18 -> ADC
+      Column 19 -> (Event)
+    """
+    wavelength_map = metadata.get('Wavelengths', {})
+
+    logger.info(f"Wavelength map from metadata: {wavelength_map}")
+
+    # Channel pairing based on OctaMon 2x3 channel + 2x1 SSC
+    # channel_number: (light_source_~850nm, light_source_~760nm)
+    channel_pairing = {
+        0: (1, 2),  # CH0: LS1 (846 nm) + LS2 (757 nm)
+        1: (3, 4),  # CH1: LS3 (848 nm) + LS4 (759 nm)
+        2: (5, 6),  # CH2: LS5 (848 nm) + LS6 (756 nm)
+        3: (7, 8),  # CH3: LS7 (848 nm) + LS8 (758 nm)
+        4: (9, 10),  # CH4: LS9 (847 nm) + LS10 (757 nm)
+        5: (11, 12),  # CH5: LS11 (848 nm) + LS12 (758 nm)
+        6: (13, 14),  # CH6: LS13 (846 nm) + LS14 (759 nm)
+        7: (15, 16),  # CH7: LS15 (846 nm) + LS16 (759 nm)
+    }
+
+    new_labels = []
+
+    for i, label in enumerate(col_labels):
+        # i is 0-based index in col_labels
+        # Column numbers in legend are 1-based
+        column_number = i + 1  # Convert to 1-based
+
+        if column_number == 1:
+            # Column 1: (Sample number)
+            new_labels.append('Sample number')
+        elif column_number == 18:
+            # Column 18: ADC
+            new_labels.append('ADC')
+        elif column_number == 19:
+            # Column 19: (Event)
+            new_labels.append('Event')
+        elif 2 <= column_number <= 17:
+            # Columns 2–17 map to light sources 1–16
+            light_source_idx = column_number - 1  # Column 2 -> LS1, Column 3 -> LS2, ..., Column 17 -> LS16
+
+            channel_found = None
+            wavelength = None
+
+            for ch_num, (ls_850, ls_760) in channel_pairing.items():
+                if light_source_idx == ls_850 or light_source_idx == ls_760:
+                    channel_found = ch_num
+                    # Prefer actual wavelength from metadata
+                    wavelength = wavelength_map.get(light_source_idx)
+                    if wavelength is None:
+                        logger.warning(
+                            f"No wavelength found for light source {light_source_idx} in metadata for {file_path}")
+                        new_labels.append(f"UNMAPPED_{light_source_idx}")
+                        break
+                    new_label = f"CH{channel_found}_WL{wavelength}"
+                    new_labels.append(new_label)
+                    logger.debug(
+                        f"Column {column_number} -> Light source {light_source_idx} ({wavelength}nm) → {new_label}"
+                    )
+                    break
+
+            if channel_found is None and wavelength is not None:
+                # Wavelength was found but no channel pairing matched
+                logger.warning(
+                    f"Could not map light source {light_source_idx} to a channel "
+                    f"in {file_path}; keeping as UNMAPPED_{light_source_idx}"
+                )
+                new_labels.append(f"UNMAPPED_{light_source_idx}")
+        else:
+            logger.warning(f"Unexpected column number {column_number} in {file_path}")
+            new_labels.append(f"UNKNOWN_COL_{column_number}")
+
+    # Check for duplicates
+    if len(new_labels) != len(set(new_labels)):
+        from collections import Counter
+        duplicates = [item for item, count in Counter(new_labels).items() if count > 1]
+        logger.error(f"DUPLICATE COLUMN NAMES: {duplicates}")
+
+    logger.info(f"Final column labels: {new_labels}")
+    return new_labels
+
+def _reassign_channels_od(df: pd.DataFrame, metadata: dict, file_path: str) -> pd.DataFrame:
+    """
+    For OD data, ensure proper channel naming and organization.
+    """
+    cols = list(df.columns)
+
+    # Keep standard columns
+    standard_cols = ['Sample number', 'ADC', 'Event']
+    data_cols = [col for col in cols if col not in standard_cols]
+
+    # Sort data columns by channel and wavelength for consistency
+    def sort_key(col):
+        if col.startswith('CH') and 'WL' in col:
+            try:
+                ch_num = int(col.split('CH')[1].split('_')[0])
+                wl_num = int(col.split('WL')[1])
+                return (ch_num, wl_num)
+            except:
+                return (999, 999)  # Put problematic columns at end
+        return (1000, 1000)
+
+    sorted_data_cols = sorted(data_cols, key=sort_key)
+
+    # Reconstruct column order
+    new_cols = []
+    if 'Sample number' in cols:
+        new_cols.append('Sample number')
+    new_cols.extend(sorted_data_cols)
+    if 'ADC' in cols:
+        new_cols.append('ADC')
+    if 'Event' in cols:
+        new_cols.append('Event')
+
+    if len(new_cols) == len(cols):
+        df = df[new_cols]
+        logger.debug(f"Reorganized OD columns for {file_path}")
+    else:
+        logger.warning(f"Column count mismatch in OD reassignment for {file_path}")
+
+    return df
 
 
 def _read_metadata(rows: list, file_path: str) -> dict:
@@ -162,14 +419,14 @@ def _read_metadata(rows: list, file_path: str) -> dict:
         val = row[1].strip()
 
         kl = key.lower()
-        # 1️⃣ Prefer “Start of measurement”
+        # Prefer "Start of measurement"
         if kl.startswith("start of measurement"):
             metadata['Measurement Start'] = val
             logger.info(f"Using 'Start of measurement' for date: {val}")
-        # 2️⃣ Then capture Record Date/Time
+        # Then capture Record Date/Time
         elif kl.startswith("record date/time"):
             metadata['Record Date/Time'] = val
-        # 3️⃣ Then Export date
+        #  Then Export date
         elif kl.startswith("export date"):
             metadata['Export date'] = val
         # also capture subject if it appears directly
@@ -198,10 +455,11 @@ def _read_metadata(rows: list, file_path: str) -> dict:
     metadata['Export file'] = file_path
     return metadata
 
+
 def _read_data(rows: list, file_path: str) -> pd.DataFrame:
     """
     Internal helper function to parse the data portion of the Oxysoft .txt file.
-    Returns a DataFrame with columns for O2Hb, HHb, Sample number, Event, etc.
+    Returns a DataFrame with columns for OD data, Sample number, Event, etc.
     """
     rows_copy = rows.copy()
     start = None
@@ -239,16 +497,18 @@ def _read_data(rows: list, file_path: str) -> pd.DataFrame:
         )
         raise
 
-    # Clean up column labels: For signals, remove the trailing part (e.g., "O2Hb(1)" -> "O2Hb")
+    # Clean up column labels for OD data
     for idx, label in enumerate(col_labels):
-        if "O2Hb" in label or "HHb" in label:
-            new_label = label.split('(')[0].strip()
-            col_labels[idx] = new_label
+        # For OD data with wavelength information
+        if any(wl in label for wl in ["730", "735", "740", "745", "750", "755", "760",
+                                      "765", "770", "805", "810", "815", "820", "825",
+                                      "830", "835", "840", "845", "850", "855", "860", "865"]):
+            # Keep wavelength information but clean up formatting
+            col_labels[idx] = re.sub(r'\([^)]*\)', '', label).strip()
         elif "(Sample number)" in label or "(Event)" in label:
             parts = label.split('(')
             if len(parts) == 2:
-                new_label = parts[1].split(')')[0]
-                col_labels[idx] = new_label
+                col_labels[idx] = parts[1].split(')')[0]
             else:
                 logger.warning(f"Unexpected format for column label '{label}'. Leaving it as is.")
         else:
@@ -298,7 +558,7 @@ def _read_data(rows: list, file_path: str) -> pd.DataFrame:
             logger.debug(f"Replaced empty strings with NaN in 'Event' column for file '{file_path}'.")
 
         df['Event'] = df['Event'].astype(str)
-        df['Event'] = df['Event'].str.strip()# Force everything to string
+        df['Event'] = df['Event'].str.strip()  # Force everything to string
         df['Event'] = df['Event'].replace('nan', np.nan)  # Reset any 'nan' strings back to real NaN
     else:
         logger.warning(f"No 'Event' column found in file '{file_path}'. This may be normal or unexpected.")
@@ -325,170 +585,4 @@ def _read_data(rows: list, file_path: str) -> pd.DataFrame:
     else:
         logger.warning(f"No 'Event' column found in file '{file_path}'. This may be normal or unexpected.")
 
-    return df
-
-
-def label_turning_epochs(fnirs_df, subject_id, metadata, turning_csv_path, sample_rate, task_type='ST'):
-    """
-    Labels rows as 'Turning' or 'Walking' by:
-    1. First trying to match fNIRS file's subject + header dates to Mobility Lab CSV
-    2. If that fails, matching subject + Visit Type (with Baseline=Pre)
-    """
-    df_turn = pd.read_csv(turning_csv_path)
-
-    # Parse the Mobility Lab timestamp into date and visit type
-    df_turn['ML Date'] = pd.to_datetime(
-        df_turn['Record Date/Time'],
-        errors='coerce',
-        utc=True
-    ).dt.tz_localize(None)  # Remove timezone for comparison
-
-    # Clean Visit Type column
-    df_turn['Visit Type'] = df_turn['Visit Type'].str.strip().str.lower()
-
-    # Build a list of possible dates from metadata (timezone-naive)
-    possible_dates = []
-    for key in ('Measurement Start', 'Record Date/Time', 'Export date'):
-        dt = metadata.get(key)
-        if dt:
-            # Try parsing without timezone first
-            p = pd.to_datetime(dt, errors='coerce')
-            if pd.isna(p):
-                p = pd.to_datetime(dt, errors='coerce', utc=True)
-
-            if not pd.isna(p):
-                # Make timezone-naive for comparison
-                p = p.tz_localize(None)
-                possible_dates.append(p.date())
-
-    # Remove duplicates while preserving order
-    possible_dates = list(dict.fromkeys(possible_dates))
-
-    # Try to get visit type from file path (Baseline or Pre)
-    visit_type = None
-    file_path = metadata.get('Export file', '')
-    if 'baseline' in file_path.lower():
-        visit_type = 'baseline'
-    elif 'pre' in file_path.lower():
-        visit_type = 'pre'
-    elif 'post' in file_path.lower():
-        visit_type = 'post'
-
-    # Debug logging
-    logger.info(f"[{task_type}] Subject {subject_id}: fNIRS dates = {possible_dates}")
-    logger.info(f"[{task_type}] Subject {subject_id}: ML dates = {df_turn['ML Date'].dt.date.unique().tolist()}")
-    logger.info(f"[{task_type}] Subject {subject_id}: Inferred visit type = {visit_type}")
-
-    # First try: match on Subject & Date
-    sub_df = df_turn[
-        (df_turn['Subject Public ID'] == subject_id) &
-        (df_turn['ML Date'].dt.date.isin(possible_dates))
-        ]
-
-    # Second try: if no date match, try matching by visit type (with Baseline=Pre)
-    if sub_df.empty and visit_type:
-        # Map our inferred visit type to possible ML visit types
-        ml_visit_types = []
-        if visit_type == 'baseline':
-            ml_visit_types = ['baseline', 'pre']  # accept either
-        elif visit_type == 'pre':
-            ml_visit_types = ['pre', 'baseline']  # accept either
-        else:
-            ml_visit_types = [visit_type]
-
-        sub_df = df_turn[
-            (df_turn['Subject Public ID'] == subject_id) &
-            (df_turn['Visit Type'].str.lower().isin(ml_visit_types))
-            ]
-        if not sub_df.empty:
-            logger.info(f"[{task_type}] Matched {subject_id} by visit type {visit_type}")
-
-    if sub_df.empty:
-        logger.warning(
-            f"[{task_type}] No turning metadata for {subject_id} on dates {possible_dates} or visit type {visit_type}")
-        fnirs_df['TaskPhase'] = 'Walking'
-        return fnirs_df
-
-    logger.info(f"[{task_type}] Found turning metadata for {subject_id}")
-
-    # extract onsets & durations
-    on = sub_df[sub_df['Measure'] == 'Turns - Turn (s)']
-    du = sub_df[sub_df['Measure'] == 'Turns - Duration (s)']
-
-    # only numeric, non-nan columns
-    turn_cols = [
-        c for c in on.columns
-        if c.isdigit() and not pd.isna(on.iloc[0][c]) and not pd.isna(du.iloc[0][c])
-    ]
-
-    fnirs_df['TaskPhase'] = 'Walking'
-    for col in turn_cols:
-        try:
-            o_sec = float(on.iloc[0][col])
-            d_sec = float(du.iloc[0][col])
-            start = int(o_sec * sample_rate)
-            end = int((o_sec + d_sec) * sample_rate)
-            if 0 <= start < len(fnirs_df):
-                end = min(end, len(fnirs_df) - 1)
-                fnirs_df.loc[start:end, 'TaskPhase'] = 'Turning'
-            else:
-                logger.warning(f"[{task_type}] Turn {col} out of bounds: {start}-{end}")
-        except Exception as e:
-            logger.warning(f"[{task_type}] Error on turn {col}: {e}")
-
-    return fnirs_df
-def _reassign_channels(df: pd.DataFrame, file_path: str) -> pd.DataFrame:
-    """
-    Reassign column names into pairs: CH0 HbO, CH0 HbR, CH1 HbO, CH1 HbR, etc.
-    If the file has an odd number of data columns (after removing Sample number/Event),
-    logs a warning and renames the available columns.
-    """
-    cols = list(df.columns)
-
-    sample_col = None
-    event_col = None
-    if "Sample number" in cols:
-        sample_col = "Sample number"
-        cols.remove("Sample number")
-    if "Event" in cols:
-        event_col = "Event"
-        cols.remove("Event")
-
-    if len(cols) == 0:
-        logger.warning(f"No data columns to rename in '{file_path}'.")
-        return df  # nothing to do
-
-    if len(cols) % 2 != 0:
-        logger.warning(
-            f"Data columns in '{file_path}' are not an even number ({len(cols)}). "
-            "Cannot reliably split into HbO/HbR pairs. We'll do the best we can."
-        )
-
-    num_channels = len(cols) // 2  # integer division
-    new_data_cols = []
-    # Use zero-based indexing: CH0, CH1, etc.
-    for i in range(num_channels):
-        new_data_cols.append(f"CH{i} HbO")
-        new_data_cols.append(f"CH{i} HbR")
-
-    extra_cols = cols[2 * num_channels:]  # any leftover columns
-
-    new_cols_order = []
-    if sample_col is not None:
-        new_cols_order.append(sample_col)
-    new_cols_order.extend(new_data_cols)
-    new_cols_order.extend(extra_cols)
-    if event_col is not None:
-        new_cols_order.append(event_col)
-
-    if len(new_cols_order) != len(df.columns):
-        logger.warning(
-            f"New column order has {len(new_cols_order)} columns but df has {len(df.columns)}. "
-            f"Skipping renaming for '{file_path}'."
-        )
-        return df
-
-    # Force assign the new column names
-    df.columns = new_cols_order
-    logger.debug(f"Reassigned columns to: {new_cols_order}")
     return df
