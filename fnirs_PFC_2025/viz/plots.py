@@ -60,12 +60,13 @@ def plot_channels_separately(data, fs, title="Channel Signals",
                     break
             if y_lim is not None:
                 ax.set_ylim(y_lim)
-            ax.set_ylabel("Δ Concentration (mmol/L)")
+            ax.set_ylabel("Δ[Hb] (µM)")
             ax.legend(loc='upper right')
 
         axes[-1].set_xlabel("Time (s)")
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         return fig, axes, y_lim
+
 
 def plot_overall_signals(df: pd.DataFrame,
                          fs: float,
@@ -103,7 +104,7 @@ def plot_overall_signals(df: pd.DataFrame,
     # Plot HHb
     if hhb is not None:
         valid_mask = ~np.isnan(hhb)
-        ax.plot(time[valid_mask], hhb[valid_mask], color='blue', label='HHb', linewidth=1.5)
+        ax.plot(time[valid_mask], hhb[valid_mask], color='blue', label='HbR', linewidth=1.5)
 
     # Determine Y limits
     if y_lim is None:
@@ -142,13 +143,10 @@ def plot_overall_signals(df: pd.DataFrame,
 
     # Final formatting
     ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Δ Concentration (mmol/L)")
+    ax.set_ylabel("Δ[Hb] (µM)")
     ax.legend(loc='upper right')
-    # Removed grid line call here
     plt.tight_layout()
     return fig, y_lim
-
-
 
 
 def calculate_global_ylim(data_list, include_cols=None):
