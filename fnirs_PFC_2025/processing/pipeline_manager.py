@@ -117,8 +117,6 @@ class PipelineManager:
             return "fTurn"
         if "LSHAPE" in basename or "L_SHAPE" in basename:
             return "LShape"
-        if "FIGURE8" in basename or "FIG8" in basename:
-            return "Figure8"
         if "OBSTACLE" in basename:
             return "Obstacle"
         if "NAVIGATION" in basename or re.search(r'\bNAV\b', basename):
@@ -533,7 +531,7 @@ class PipelineManager:
                         f"Val.Fail: {validation_failed_count:2} | Proc.Fail: {processing_failed_count:2}")
 
         # Highlight validation issues for event-dependent tasks
-        event_dependent_tasks = ['fTurn', 'LShape', 'Figure8', 'Obstacle', 'Navigation']
+        event_dependent_tasks = ['fTurn', 'LShape', 'Obstacle', 'Navigation']
         validation_issues = []
 
         for sqi_mode in ['no_sqi_filtering', 'with_sqi_filtering']:
