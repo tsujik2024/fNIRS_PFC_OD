@@ -11,6 +11,7 @@ class StatsCollector:
     """
     FIXED StatsCollector - properly extracts timepoint from folder structure (Pre/Post folders)
     and correctly handles both single-batch and dual-batch output directory structures.
+    Includes fallback broad search when strict path reconstruction fails.
     """
 
     def __init__(self, fs: float = 50.0):
@@ -43,6 +44,14 @@ class StatsCollector:
         logger.info(f" Processing {file_type} statistics for {len(unique_processed_files)} UNIQUE input files")
         logger.info(f"   Will look for processed versions in: {output_base_dir}")
 
+        # Pre-build an index of all processed CSVs in the output tree for fallback search
+        self._output_csv_index = self._build_output_csv_index(output_base_dir)
+        logger.info(f"   Indexed {len(self._output_csv_index)} processed CSV files in output tree")
+
+        files_found = 0
+        files_not_found = 0
+        not_found_list = []
+
         for file_path in unique_processed_files:
             # FIXED: Extract metadata properly from file path
             subject, timepoint = self._extract_metadata_from_path(file_path)
@@ -58,8 +67,11 @@ class StatsCollector:
             if not all_processed_dfs:
                 logger.warning(
                     f" Skipping stats for {os.path.basename(file_path)} - no {file_type} processed files found")
+                files_not_found += 1
+                not_found_list.append(os.path.basename(file_path))
                 continue
 
+            files_found += 1
             logger.info(f"   Found {len(all_processed_dfs)} {file_type} processed file version(s)")
 
             # Calculate statistics for EACH processed file version
@@ -95,13 +107,49 @@ class StatsCollector:
                 else:
                     logger.warning(f"       Stats calculation returned None")
 
+        # Log summary of found vs not found
+        logger.info(f" Stats collection summary: {files_found} files found, {files_not_found} files NOT found")
+        if not_found_list:
+            logger.warning(f" Files with no matching processed CSV ({len(not_found_list)}):")
+            for fname in not_found_list[:20]:
+                logger.warning(f"   - {fname}")
+            if len(not_found_list) > 20:
+                logger.warning(f"   ... and {len(not_found_list) - 20} more")
+
         if all_stats:
             logger.info(f" Successfully calculated {file_type} statistics for {len(all_stats)} UNIQUE file versions")
             logger.info(f"   From {len(unique_processed_files)} input files")
         else:
             logger.warning(f" No {file_type} statistics were calculated!")
 
+        # Clean up index
+        self._output_csv_index = None
+
         return self._create_stats_dataframe(all_stats)
+
+    def _build_output_csv_index(self, output_base_dir: str) -> Dict[str, List[str]]:
+        """
+        Build an index of all processed CSV files in the output directory tree.
+        Maps base_name (without _OD, without extension) to list of full paths.
+        This enables fast fallback lookups when strict path reconstruction fails.
+        """
+        index = {}
+        for root, _, files in os.walk(output_base_dir):
+            for filename in files:
+                if filename.endswith('.csv') and 'FULLY_PROCESSED' in filename:
+                    full_path = os.path.join(root, filename)
+                    # Extract the original base name from the processed filename
+                    # e.g., "Walking_DT_OD.txt_FULLY_PROCESSED_RAW_with_SQI_filtering.csv"
+                    # We want to index by everything before "_FULLY_PROCESSED"
+                    # NOTE: file_processor may leave .txt in the output filename,
+                    # so we normalize by stripping it
+                    parts = filename.split('_FULLY_PROCESSED')
+                    if parts:
+                        base_key = parts[0].replace('.txt', '').replace('.TXT', '')
+                        if base_key not in index:
+                            index[base_key] = []
+                        index[base_key].append(full_path)
+        return index
 
     def _extract_metadata_from_path(self, file_path: str) -> Tuple[str, str]:
         """
@@ -178,8 +226,7 @@ class StatsCollector:
         """
         Load processed file versions using the SAME path logic as file_processor._create_output_dir.
 
-        FIXED: Correctly handles both single-batch mode (files directly in output_base_dir)
-        and dual-batch mode (files in batch_with_SQI_filtering / batch_no_SQI_filtering subdirs).
+        FIXED: Includes fallback broad search when strict path reconstruction fails.
 
         Args:
             file_path: Original input file path
@@ -189,34 +236,22 @@ class StatsCollector:
         """
         try:
             file_basename = os.path.basename(file_path)
-            base_name_without_ext = file_basename.replace('.txt', '').replace('_OD', '')
+            # Build candidate base names: try WITH _OD first (exact), then WITHOUT
+            base_name_raw = file_basename.replace('.txt', '').replace('.TXT', '')
+            base_name_no_od = base_name_raw.replace('_OD', '')
+
+            # Use both as candidates for matching
+            base_name_candidates = [base_name_raw]
+            if base_name_no_od != base_name_raw:
+                base_name_candidates.append(base_name_no_od)
 
             subject, timepoint = self._extract_metadata_from_path(file_path)
 
-            logger.info(f" Searching for {file_type} versions of: {base_name_without_ext}")
+            logger.info(f" Searching for {file_type} versions of: {base_name_candidates}")
             logger.info(f"   Subject: {subject}, Timepoint: {timepoint}")
 
-            # FIXED: Determine search directories based on what actually exists.
-            # In dual-batch mode, output_base_dir might be a batch-specific dir already,
-            # or it might be the parent dir containing batch subdirs.
-            # In single-batch mode, files are directly in output_base_dir.
-            batch_dirs = []
-
-            if "batch_with_SQI_filtering" in output_base_dir or "batch_no_SQI_filtering" in output_base_dir:
-                # output_base_dir is already a batch-specific directory
-                batch_dirs = [output_base_dir]
-            else:
-                # Check if batch subdirectories exist (dual-batch mode)
-                batch_with_dir = os.path.join(output_base_dir, "batch_with_SQI_filtering")
-                batch_no_dir = os.path.join(output_base_dir, "batch_no_SQI_filtering")
-
-                if os.path.exists(batch_with_dir) or os.path.exists(batch_no_dir):
-                    # Dual-batch mode: search in batch subdirectories
-                    batch_dirs = [batch_with_dir, batch_no_dir]
-                else:
-                    # FIXED: Single-batch mode: search directly in output_base_dir
-                    batch_dirs = [output_base_dir]
-                    logger.info(f"   Single-batch mode: searching directly in {output_base_dir}")
+            # Determine search directories based on what actually exists
+            batch_dirs = self._determine_batch_dirs(output_base_dir)
 
             # Determine file pattern
             if file_type == "RAW":
@@ -234,93 +269,83 @@ class StatsCollector:
 
             found_files_by_batch = {}
 
+            # === ATTEMPT 1: Strict path reconstruction ===
             for batch_dir in batch_dirs:
                 if not os.path.exists(batch_dir):
-                    logger.warning(f"    Directory does not exist: {batch_dir}")
                     continue
 
-                # Determine batch type from directory name
-                batch_dir_basename = os.path.basename(batch_dir)
-                if "with_SQI" in batch_dir_basename:
-                    batch_type = "SQI_Filtered"
-                elif "no_SQI" in batch_dir_basename or "without_SQI" in batch_dir_basename:
-                    batch_type = "All_Channels"
-                else:
-                    # Single-batch mode: determine from file content later,
-                    # default to All_Channels
-                    batch_type = "All_Channels"
-
-                logger.info(f"    Searching in: {batch_dir_basename} (Type: {batch_type})")
+                batch_type = self._determine_batch_type(batch_dir)
 
                 if batch_type in found_files_by_batch:
-                    logger.warning(f"       Already have a file for {batch_type}, skipping")
                     continue
 
-                # Use relpath to find the exact output directory
                 expected_dir = os.path.join(batch_dir, relative_path)
 
                 if not os.path.exists(expected_dir):
-                    logger.warning(f"       Expected directory does not exist: {expected_dir}")
+                    logger.debug(f"       Expected directory does not exist: {expected_dir}")
                     continue
 
-                logger.info(f"       Looking in: {expected_dir}")
+                result = self._search_directory_for_file(
+                    expected_dir, base_name_candidates, search_pattern, batch_type
+                )
+                if result:
+                    actual_batch_type, df, full_path = result
+                    found_files_by_batch[actual_batch_type] = (df, full_path)
 
-                # Walk the expected directory and subdirectories (task type folders)
-                file_found = False
-                for root, dirs, files in os.walk(expected_dir):
-                    if file_found:
-                        break
+            # === ATTEMPT 2: Fallback broad search using pre-built index ===
+            if not found_files_by_batch and hasattr(self, '_output_csv_index') and self._output_csv_index:
+                logger.info(f"   Strict path lookup failed, trying fallback index search for: {base_name_candidates}")
 
-                    for filename in files:
-                        if (search_pattern in filename
-                                and filename.endswith(".csv")
-                                and base_name_without_ext in filename):
+                matching_paths = []
+                for candidate in base_name_candidates:
+                    # Exact key match first
+                    if candidate in self._output_csv_index:
+                        matching_paths.extend(self._output_csv_index[candidate])
 
-                            full_path = os.path.join(root, filename)
-                            logger.info(f"       FOUND {file_type} FILE: {filename}")
-                            logger.info(f"         Full path: {full_path}")
+                if matching_paths:
+                    logger.info(f"   Fallback found {len(matching_paths)} candidate(s)")
 
-                            try:
-                                df = pd.read_csv(full_path)
+                    for full_path in matching_paths:
+                        filename = os.path.basename(full_path)
 
-                                required_columns = {'grand oxy', 'grand deoxy', 'Time (s)'}
-                                if not required_columns.issubset(df.columns):
-                                    missing = required_columns - set(df.columns)
-                                    logger.warning(f"          Missing columns {missing}")
-                                    continue
+                        # Verify it matches our search pattern
+                        if search_pattern not in filename:
+                            continue
 
-                                if df.empty:
-                                    logger.warning(f"          File is empty (0 rows): {filename}")
-                                    continue
+                        # Verify precise match: the part before _FULLY_PROCESSED must
+                        # exactly match one of our candidates (after normalizing .txt)
+                        csv_base = filename.split('_FULLY_PROCESSED')[0]
+                        csv_base = csv_base.replace('.txt', '').replace('.TXT', '')
+                        if csv_base not in base_name_candidates:
+                            continue
 
-                                # FIXED: In single-batch mode, detect SQI status from file content
-                                actual_batch_type = batch_type
-                                if 'SQI_Filtering_Applied' in df.columns:
-                                    sqi_applied = df['SQI_Filtering_Applied'].iloc[0]
-                                    if sqi_applied:
-                                        actual_batch_type = "SQI_Filtered"
-                                    else:
-                                        actual_batch_type = "All_Channels"
+                        batch_type = self._determine_batch_type_from_path(full_path)
 
-                                found_files_by_batch[actual_batch_type] = (df, full_path)
-                                logger.info(
-                                    f"          LOADED: {actual_batch_type} {file_type} version ({len(df)} rows)")
-                                file_found = True
-                                break
+                        if batch_type in found_files_by_batch:
+                            continue
 
-                            except Exception as e:
-                                logger.error(f"          Error reading: {str(e)}")
+                        try:
+                            df = pd.read_csv(full_path)
+                            required_columns = {'grand oxy', 'grand deoxy', 'Time (s)'}
+                            if not required_columns.issubset(df.columns):
+                                continue
+                            if df.empty:
                                 continue
 
-                    if not file_found:
-                        # Log what files ARE in the directory for debugging
-                        all_csvs = [f for f in files if f.endswith('.csv')]
-                        if all_csvs:
-                            logger.warning(
-                                f"       No match found. CSVs present in {os.path.basename(root)}: {all_csvs[:5]}")
+                            # Detect actual SQI status from file content
+                            actual_batch_type = batch_type
+                            if 'SQI_Filtering_Applied' in df.columns:
+                                sqi_applied = df['SQI_Filtering_Applied'].iloc[0]
+                                actual_batch_type = "SQI_Filtered" if sqi_applied else "All_Channels"
 
-                if not file_found:
-                    logger.warning(f"       No matching {file_type} file found under {expected_dir}")
+                            found_files_by_batch[actual_batch_type] = (df, full_path)
+                            logger.info(f"   FALLBACK FOUND: {filename} as {actual_batch_type}")
+
+                        except Exception as e:
+                            logger.error(f"   Fallback error reading {full_path}: {e}")
+                            continue
+                else:
+                    logger.warning(f"   Fallback search also found no matches for: {base_name_candidates}")
 
             # Convert to list format
             found_files = [(df, batch_type) for batch_type, (df, path) in found_files_by_batch.items()]
@@ -328,7 +353,7 @@ class StatsCollector:
             logger.info(f" Total loaded {file_type} file versions: {len(found_files)}")
 
             if not found_files:
-                logger.error(f" No processed {file_type} files found for {base_name_without_ext}")
+                logger.error(f" No processed {file_type} files found for {base_name_candidates}")
                 logger.error(f"   Searched relative path: {relative_path}")
                 logger.error(f"   Search pattern: {search_pattern}")
                 logger.error(f"   In dirs: {[os.path.basename(d) for d in batch_dirs]}")
@@ -338,6 +363,105 @@ class StatsCollector:
         except Exception as e:
             logger.error(f" Error loading processed files for {file_path}: {str(e)}", exc_info=True)
             return []
+
+    def _determine_batch_dirs(self, output_base_dir: str) -> List[str]:
+        """Determine which batch directories to search."""
+        if "batch_with_SQI_filtering" in output_base_dir or "batch_no_SQI_filtering" in output_base_dir:
+            return [output_base_dir]
+
+        batch_with_dir = os.path.join(output_base_dir, "batch_with_SQI_filtering")
+        batch_no_dir = os.path.join(output_base_dir, "batch_no_SQI_filtering")
+
+        if os.path.exists(batch_with_dir) or os.path.exists(batch_no_dir):
+            return [batch_with_dir, batch_no_dir]
+
+        return [output_base_dir]
+
+    def _determine_batch_type(self, batch_dir: str) -> str:
+        """Determine batch type from directory path."""
+        batch_dir_basename = os.path.basename(batch_dir)
+        if "with_SQI" in batch_dir_basename:
+            return "SQI_Filtered"
+        elif "no_SQI" in batch_dir_basename or "without_SQI" in batch_dir_basename:
+            return "All_Channels"
+        return "All_Channels"
+
+    def _determine_batch_type_from_path(self, file_path: str) -> str:
+        """Determine batch type from any part of a file path."""
+        if "batch_with_SQI_filtering" in file_path or "with_SQI_filtering" in file_path:
+            return "SQI_Filtered"
+        elif "batch_no_SQI_filtering" in file_path or "without_SQI_filtering" in file_path:
+            return "All_Channels"
+        return "All_Channels"
+
+    def _search_directory_for_file(self,
+                                   search_dir: str,
+                                   base_name_candidates: List[str],
+                                   search_pattern: str,
+                                   batch_type: str) -> Optional[Tuple[str, pd.DataFrame, str]]:
+        """
+        Search a directory tree for a matching processed CSV file.
+        Uses PRECISE matching: the portion before _FULLY_PROCESSED must exactly
+        match one of the candidate base names to avoid cross-matching
+        (e.g., Walking_DT matching Walking_DT-AC).
+
+        Args:
+            search_dir: Directory to search
+            base_name_candidates: List of possible base names (with and without _OD)
+            search_pattern: Pattern to look for (e.g., "FULLY_PROCESSED_RAW")
+            batch_type: Default batch type from directory name
+
+        Returns:
+            Tuple of (actual_batch_type, dataframe, full_path) or None
+        """
+        for root, dirs, files in os.walk(search_dir):
+            for filename in files:
+                if not (search_pattern in filename and filename.endswith(".csv")):
+                    continue
+
+                # PRECISE match: extract the base name from the CSV filename
+                # e.g., "Walking_DT_OD.txt_FULLY_PROCESSED_RAW_without_SQI_filtering.csv"
+                #    -> csv_base = "Walking_DT_OD" (after stripping .txt)
+                csv_base = filename.split('_FULLY_PROCESSED')[0]
+                csv_base = csv_base.replace('.txt', '').replace('.TXT', '')
+
+                # Check if csv_base exactly matches one of our candidates
+                if csv_base not in base_name_candidates:
+                    continue
+
+                full_path = os.path.join(root, filename)
+                logger.info(f"       FOUND (precise match): {filename}")
+
+                try:
+                    df = pd.read_csv(full_path)
+
+                    required_columns = {'grand oxy', 'grand deoxy', 'Time (s)'}
+                    if not required_columns.issubset(df.columns):
+                        missing = required_columns - set(df.columns)
+                        logger.warning(f"          Missing columns {missing}")
+                        continue
+
+                    if df.empty:
+                        logger.warning(f"          File is empty (0 rows): {filename}")
+                        continue
+
+                    # Detect SQI status from file content
+                    actual_batch_type = batch_type
+                    if 'SQI_Filtering_Applied' in df.columns:
+                        sqi_applied = df['SQI_Filtering_Applied'].iloc[0]
+                        if sqi_applied:
+                            actual_batch_type = "SQI_Filtered"
+                        else:
+                            actual_batch_type = "All_Channels"
+
+                    logger.info(f"          LOADED: {actual_batch_type} ({len(df)} rows)")
+                    return (actual_batch_type, df, full_path)
+
+                except Exception as e:
+                    logger.error(f"          Error reading: {str(e)}")
+                    continue
+
+        return None
 
     def _calculate_file_statistics(self,
                                    processed_df: pd.DataFrame,
