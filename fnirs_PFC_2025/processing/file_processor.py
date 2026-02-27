@@ -54,7 +54,6 @@ class FileProcessor:
             # Event-dependent tasks - look for task start (after baseline)
             'fTurn': ['S2', 'START', 'TASK_START', 'GO'],
             'LShape': ['W1', 'WALK', 'START_WALK', 'S3'],  # W1 after S2 baseline
-            'Figure8': ['S2', 'START', 'TASK_START', 'GO'],
             'Obstacle': ['S2', 'START', 'TASK_START', 'GO'],
             'Navigation': ['S2', 'START', 'TASK_START', 'GO'],
         }
@@ -69,7 +68,6 @@ class FileProcessor:
             # Event-dependent tasks - require sufficient event markers
             'fTurn': {'type': 'event_dependent', 'min_events': 3},
             'LShape': {'type': 'event_dependent', 'min_events': 3},
-            'Figure8': {'type': 'event_dependent', 'min_events': 3},
             'Obstacle': {'type': 'event_dependent', 'min_events': 3},
             'Navigation': {'type': 'event_dependent', 'min_events': 2},
         }
@@ -140,6 +138,9 @@ class FileProcessor:
             subject = self._extract_subject(file_path)
             raw_limits = self._get_plotting_limits(subject, subject_y_limits)
 
+            # Store file_basename for use in fallback timing
+            self._current_file_basename = file_basename
+
             logger.info(f" Starting: {file_path} (SQI filtering: {'ON' if self.enable_sqi_filtering else 'OFF'}, "
                         f"post-walking trim: {self.post_walking_trim_seconds}s)")
 
@@ -172,6 +173,12 @@ class FileProcessor:
             logger.debug(f"Detected task type: {task_type}")
 
             task_config = self.task_types.get(task_type, {'type': 'unknown', 'min_events': 2})
+
+            # Log timing info for this file
+            timing = self._get_task_timing(file_basename, task_type)
+            logger.info(f"Task timing for {file_basename}: {timing['total_expected']}s total "
+                        f"({timing['baseline_duration']}s baseline + {timing['task_duration']}s task + "
+                        f"{timing['end_duration']}s end)")
 
             # ─── 4) Extract and clean events ──────────────────────────────
             events = self._extract_and_clean_events(data_dict, data)
@@ -220,6 +227,65 @@ class FileProcessor:
             logger.error(f" Exception in process_file for {file_path}: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
 
+    def _get_task_timing(self, file_basename: str, task_type: str) -> dict:
+        """
+        Get expected timing parameters based on FILENAME (not just task type).
+
+        This handles the distinction between:
+          - 90s tasks: Turn_DT, Turn_ST, Walking_DT-AC, Walking_DT-TMB, Walking_DT_DM
+          - 150s tasks: plain Walking_DT, Walking_ST, DT, ST
+
+        Args:
+            file_basename: Original filename for pattern matching
+            task_type: Detected task type
+
+        Returns:
+            Dict with baseline_duration, task_duration, end_duration, total_expected
+        """
+        s = file_basename.upper()
+
+        # --- 90-second tasks (20s baseline + 60s task + 10s end) ---
+        # Turn_DT, Turn_ST (walking turn tasks, NOT fTurn)
+        if re.search(r'TURN[_-]?(DT|ST)', s) and 'FTURN' not in s and 'F_TURN' not in s:
+            logger.debug(f"Timing: 90s (Turn walking task)")
+            return {
+                "baseline_duration": 20.0,
+                "task_duration": 60.0,
+                "end_duration": 10.0,
+                "total_expected": 90.0
+            }
+
+        # Walking_DT with suffixes: DT-AC, DT-TMB, DT_DM, ST-AC, etc.
+        # Match DT or ST followed by a hyphen or underscore and more letters
+        if re.search(r'(DT|ST)[_-][A-Z]', s):
+            logger.debug(f"Timing: 90s (DT/ST variant task)")
+            return {
+                "baseline_duration": 20.0,
+                "task_duration": 60.0,
+                "end_duration": 10.0,
+                "total_expected": 90.0
+            }
+
+        # --- 150-second tasks (20s baseline + 120s task + 10s end) ---
+        if task_type in ('DT', 'ST', 'LongWalk'):
+            logger.debug(f"Timing: 150s (standard long walk)")
+            return {
+                "baseline_duration": 20.0,
+                "task_duration": 120.0,
+                "end_duration": 10.0,
+                "total_expected": 150.0
+            }
+
+        # --- Event-dependent tasks: timing not used for baseline (events required) ---
+        # Return a reasonable default anyway
+        logger.debug(f"Timing: event-dependent task, default 150s")
+        return {
+            "baseline_duration": 20.0,
+            "task_duration": 120.0,
+            "end_duration": 10.0,
+            "total_expected": 150.0
+        }
+
     def _process_pipeline_stages(self, data: pd.DataFrame,
                                  output_dir: str, file_basename: str,
                                  events: Optional[pd.DataFrame] = None,
@@ -257,7 +323,7 @@ class FileProcessor:
         logger.info(f"Found {len(od_cols)} OD columns: {od_cols}")
 
         # DEBUG: Check OD values before conversion
-        logger.info("🔍 DEBUG: Checking OD values before concentration conversion")
+        logger.info("DEBUG: Checking OD values before concentration conversion")
         for col in od_cols[:4]:  # Check first 4 columns
             od_values = data[col].values
             logger.info(f"   {col}: min={od_values.min():.6f}, max={od_values.max():.6f}, mean={od_values.mean():.6f}")
@@ -594,7 +660,7 @@ class FileProcessor:
                 logger.info(f"Saved raw concentration overall plot")
 
                 # Log some statistics about the raw concentration data
-                logger.info(f"📊 Raw concentration statistics (long channels only):")
+                logger.info(f"Raw concentration statistics (long channels only):")
                 logger.info(f"   HbO mean: {avg_o2hb.mean():.4f} µM, std: {avg_o2hb.std():.4f} µM")
                 logger.info(f"   HbR mean: {avg_hhb.mean():.4f} µM, std: {avg_hhb.std():.4f} µM")
 
@@ -871,7 +937,7 @@ class FileProcessor:
             trimmed_data['Time (s)'] = trimmed_data['Sample number'] / self.fs
 
         removed = len(data) - len(trimmed_data)
-        logger.info(f"✂️ Applied post-walking trimming: removed {removed} samples (~{removed / self.fs:.1f}s)")
+        logger.info(f"Applied post-walking trimming: removed {removed} samples (~{removed / self.fs:.1f}s)")
 
         return trimmed_data
 
@@ -1084,14 +1150,14 @@ class FileProcessor:
         else:
             logger.info(f"All {len(all_channels)} channels passed SQI quality threshold (>= {self.sqi_threshold})")
 
-        logger.info(f"📊 SQI SUMMARY: {len(flagged)} poor channels, {len(excluded_channels)} excluded")
+        logger.info(f"SQI SUMMARY: {len(flagged)} poor channels, {len(excluded_channels)} excluded")
         return excluded_channels
 
     def _convert_od_to_concentration(self, data: pd.DataFrame, od_cols: List[str], channel_groups: dict) -> Optional[
         pd.DataFrame]:
         """Convert OD to concentration using MBLL and Prahl/OMLC extinction coefficients."""
         try:
-            logger.info(" Converting OD → concentration using Prahl/OMLC extinction coefficients (cm^-1/M)")
+            logger.info(" Converting OD to concentration using Prahl/OMLC extinction coefficients (cm^-1/M)")
 
             DPF = 6.0
             DISTANCE_CM = 3.5
@@ -1125,7 +1191,7 @@ class FileProcessor:
             def _eps_at_nm(w: float) -> Tuple[float, float]:
                 if w < wl_grid.min() or w > wl_grid.max():
                     raise ValueError(
-                        f"Wavelength {w} nm outside Prahl table range ({wl_grid.min()}–{wl_grid.max()} nm).")
+                        f"Wavelength {w} nm outside Prahl table range ({wl_grid.min()}-{wl_grid.max()} nm).")
                 eps_hbo2 = float(np.interp(w, wl_grid, hbO2_grid))
                 eps_hb = float(np.interp(w, wl_grid, hb_grid))
                 return eps_hbo2, eps_hb
@@ -1172,34 +1238,48 @@ class FileProcessor:
                 logger.debug(
                     f"{ch_id} ({wl1:.0f}/{wl2:.0f} nm) means HbO={np.nanmean(hbO_uM):.3f} µM, HbR={np.nanmean(hbR_uM):.3f} µM")
 
-            logger.info(f" Converted {converted_channels} channels OD → µM using Prahl coefficients")
+            logger.info(f" Converted {converted_channels} channels OD to µM using Prahl coefficients")
             return concentration_data if not concentration_data.empty else None
 
         except Exception as e:
-            logger.error(f"OD→concentration conversion failed: {str(e)}", exc_info=True)
+            logger.error(f"OD to concentration conversion failed: {str(e)}", exc_info=True)
             return None
 
     def _determine_task_type(self, file_basename: str) -> str:
-        """Determine task type from filename with boundary-aware matching."""
+        """
+        Determine task type from filename with boundary-aware matching.
+
+        IMPORTANT: fTurn is detected ONLY by explicit 'FTURN' or 'F_TURN' patterns.
+        Turn_DT / Turn_ST are walking tasks (not fTurn) and are classified as DT/ST.
+        """
         s = file_basename.upper()
 
-        if "FTURN" in s or "F_TURN" in s or re.search(r'\bTURN\b', s):
+        # 1. fTurn - ONLY explicit fTurn/F_TURN patterns
+        if "FTURN" in s or "F_TURN" in s:
             return "fTurn"
+
+        # 2. LShape
         if "LSHAPE" in s or "L_SHAPE" in s:
             return "LShape"
-        if "FIGURE8" in s or "FIG8" in s:
-            return "Figure8"
+
+        # 3. Obstacle
         if "OBSTACLE" in s:
             return "Obstacle"
+
+        # 4. Navigation
         if "NAVIGATION" in s or re.search(r'\bNAV\b', s):
             return "Navigation"
-        if "WALK" in s:
-            return "LongWalk"
 
+        # 5. DT/ST detection (catches Turn_DT, Walking_DT, Walking_DT-AC, etc.)
+        #    These are all long_walk type tasks with event-based or fallback baseline
         if re.search(r'(^|[^A-Z])DT([^A-Z]|$)', s):
             return "DT"
         if re.search(r'(^|[^A-Z])ST([^A-Z]|$)', s):
             return "ST"
+
+        # 6. Generic walk (no DT/ST suffix)
+        if "WALK" in s:
+            return "LongWalk"
 
         logger.warning(f" Unknown task type from filename: {file_basename}")
         return "Unknown"
@@ -1359,7 +1439,7 @@ class FileProcessor:
         try:
             if events is None or events.empty:
                 logger.warning("No events available for baseline correction, using fallback")
-                return self._fallback_baseline_correction(data)
+                return self._fallback_baseline_correction(data, task_type)
 
             events = events.copy()
             events['Event'] = events['Event'].astype(str).str.strip().str.upper()
@@ -1437,7 +1517,7 @@ class FileProcessor:
             task_config = self.task_types.get(task_type, {})
             if task_config.get('type') == 'long_walk':
                 logger.warning("No event-based baseline found for long walk task, using time-based fallback")
-                return self._fallback_baseline_correction(data)
+                return self._fallback_baseline_correction(data, task_type)
             else:
                 logger.error(" No valid baseline markers found for event-dependent task")
                 return None
@@ -1446,29 +1526,51 @@ class FileProcessor:
             logger.error(f"Standard baseline correction failed: {str(e)}")
             return None
 
-    def _fallback_baseline_correction(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Fallback baseline correction using end-of-recording."""
+    def _fallback_baseline_correction(self, data: pd.DataFrame, task_type: str = None) -> pd.DataFrame:
+        """
+        Fallback baseline correction using task-specific timing calculated from
+        end-of-recording.
+
+        Uses _get_task_timing() to determine correct durations based on the
+        actual filename (90s vs 150s tasks).
+        """
         try:
             total = len(data)
-            if total < int(20 * self.fs):
-                logger.warning("Fallback baseline: record too short; returning data without subtraction")
+
+            # Get task-specific timing from the current filename
+            file_basename = getattr(self, '_current_file_basename', '')
+            timing = self._get_task_timing(file_basename, task_type or 'Unknown')
+
+            total_expected = timing['total_expected']
+            baseline_duration = timing['baseline_duration']
+            end_duration = timing['end_duration']
+
+            logger.info(f"Fallback baseline using timing: {total_expected}s total "
+                        f"({baseline_duration}s baseline, {end_duration}s end)")
+
+            min_required = int(baseline_duration * self.fs)
+            if total < min_required:
+                logger.warning(f"Fallback baseline: record too short ({total} samples < {min_required} required); "
+                               f"returning data without subtraction")
                 return data
 
-            s1 = max(0, min(total - 1, int(total - 150 * self.fs)))
-            s2 = max(0, min(total - 1, int(total - 130 * self.fs)))
-            s3 = max(0, min(total - 1, int(total - 10 * self.fs)))
+            # Calculate baseline window from end of recording
+            s1 = max(0, min(total - 1, int(total - total_expected * self.fs)))
+            s2 = max(0, min(total - 1, int(total - (total_expected - baseline_duration) * self.fs)))
+            s3 = max(0, min(total - 1, int(total - end_duration * self.fs)))
 
             marks = sorted({s1, s2, s3})
             if len(marks) < 3 or marks[1] - marks[0] < int(2 * self.fs):
-                base = max(0, total - int(150 * self.fs))
-                end = max(base + int(2 * self.fs), min(total - 1, total - int(10 * self.fs)))
+                base = max(0, total - int(total_expected * self.fs))
+                end = max(base + int(2 * self.fs), min(total - 1, total - int(end_duration * self.fs)))
                 marks = [base, base + int(2 * self.fs), end]
 
             fallback_events = pd.DataFrame({
                 'Sample number': marks,
                 'Event': ['S1', 'S2', 'S3']
             })
-            logger.warning(f"Using fallback end-of-recording baseline markers: {marks}")
+            logger.warning(f"Using fallback end-of-recording baseline markers: {marks} "
+                           f"(timing: {total_expected}s total for '{file_basename}')")
             return baseline_subtraction(data, fallback_events)
 
         except Exception as e:
@@ -1546,7 +1648,7 @@ class FileProcessor:
             logger.info(f" Saved Z-SCORED data to {output_file_z}")
 
             try:
-                plot_condition = f"{walk_type}_{task_type}" if walk_type != "Unknown" else task_type
+                plot_condition = task_type
 
                 self._create_final_plot(
                     averaged_raw, condition_dir, file_basename, f"{plot_condition}{sqi_suffix}",
