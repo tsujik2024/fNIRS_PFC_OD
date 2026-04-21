@@ -102,16 +102,13 @@ def _find_matching_short(long_ch: str, short_data: pd.DataFrame) -> str:
     ch_num = int(m.group(1))
     chromo = m.group(2)
 
-    SHORT_IDS = {2, 6}
+    SHORT_IDS = {4, 6}
     if ch_num in SHORT_IDS:
-        raise KeyError(f"{long_ch} is a short channel (CH2/CH6) and should not be SCR-corrected.")
+        raise KeyError(f"{long_ch} is a short channel (CH4/CH6) and should not be SCR-corrected.")
 
-    # Pick your mapping. You must choose which long channels pair with which short.
-    # If you don't know yet, this is a reasonable starting point:
     channel_mapping = {
-        0: 6, 1: 6, 3: 6,   # example grouping to CH6
-        4: 2, 5: 2, 7: 2,   # example grouping to CH2
-        # NOTE: you must decide where CH7 belongs if CH7 is a long channel in your setup
+        1: 4, 2: 4, 3: 4,  
+        5: 6, 7: 6, 8: 6,   
     }
 
     target_short_num = channel_mapping.get(ch_num)
