@@ -1,0 +1,228 @@
+"""Automatic channel rejection by scalp-coupling quality (SCI + PSP).
+
+This runs *before* the rest of preprocessing. Each channel's two-wavelength
+optical-density traces are scored with the Scalp Coupling Index (SCI, Pollonini
+2014) and Peak Spectral Power (PSP, PHOEBE / Pollonini 2016). A channel is
+rejected if it fails *either* threshold:
+
+* ``SCI < sci_threshold``  (default 0.75)
+* ``PSP < psp_threshold``  (default 0.10)
+
+Short channels are retained by default even when they fail, because they are
+used as regressors rather than as signal (set ``exclude_failing_short_channels``
+to change this). The result is a :class:`QualityReport` summarising every
+channel's score and verdict, plus the list of OD columns to keep downstream.
+
+Channel columns are expected to be named ``CH{n}_WL{wavelength}`` (e.g.
+``CH0_WL757``, ``CH0_WL846``), matching the project's loader output. Channel
+indices are **zero-based** (``CH0``..``CH7``), so ``short_channels`` must use the
+same convention: the OctaMon short channels labelled 4 and 6 in 1-based optode
+numbering are ``CH3`` and ``CH5`` here, which is the default.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+from fnirs_PFC_2025.preprocessing.psp import peak_spectral_power
+from fnirs_PFC_2025.preprocessing.sci import scalp_coupling_index
+
+logger = logging.getLogger(__name__)
+
+# Literature defaults (Pollonini / PHOEBE).
+DEFAULT_SCI_THRESHOLD = 0.75
+DEFAULT_PSP_THRESHOLD = 0.10
+DEFAULT_CARDIAC_BAND = (0.5, 2.5)
+DEFAULT_FILTER_ORDER = 4
+
+_CHANNEL_RE = re.compile(r"CH(\d+)_WL(\d+)", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class ChannelQuality:
+    """SCI/PSP scores and verdict for a single channel."""
+
+    channel: int
+    is_short: bool
+    sci: float
+    psp: float
+    passed: bool
+    reasons: Tuple[str, ...] = ()
+
+    @property
+    def reason_text(self) -> str:
+        """Human-readable verdict ("OK" when passed)."""
+        return "OK" if self.passed else "; ".join(self.reasons)
+
+
+@dataclass
+class QualityReport:
+    """Outcome of channel quality control for one recording."""
+
+    channels: List[ChannelQuality] = field(default_factory=list)
+    sci_threshold: float = DEFAULT_SCI_THRESHOLD
+    psp_threshold: float = DEFAULT_PSP_THRESHOLD
+
+    @property
+    def retained(self) -> List[ChannelQuality]:
+        return [c for c in self.channels if c.passed]
+
+    @property
+    def rejected(self) -> List[ChannelQuality]:
+        return [c for c in self.channels if not c.passed]
+
+    @property
+    def retained_channels(self) -> List[int]:
+        return [c.channel for c in self.retained]
+
+    @property
+    def n_long_total(self) -> int:
+        return sum(1 for c in self.channels if not c.is_short)
+
+    @property
+    def n_long_retained(self) -> int:
+        return sum(1 for c in self.retained if not c.is_short)
+
+    def summary_line(self) -> str:
+        """One-line summary, e.g. '5 of 6 channels retained (long: 3/4)'."""
+        return (f"{len(self.retained)} of {len(self.channels)} channels retained "
+                f"(long: {self.n_long_retained}/{self.n_long_total})")
+
+    def to_dataframe(self) -> pd.DataFrame:
+        """Tabulate per-channel scores and verdicts."""
+        return pd.DataFrame([
+            {
+                "Channel": c.channel,
+                "Short": c.is_short,
+                "SCI": c.sci,
+                "PSP": c.psp,
+                "Passed": c.passed,
+                "Reason": c.reason_text,
+            }
+            for c in self.channels
+        ])
+
+
+class ChannelQualityControl:
+    """Score channels with SCI/PSP and decide which to keep."""
+
+    def __init__(
+        self,
+        fs: float,
+        sci_threshold: float = DEFAULT_SCI_THRESHOLD,
+        psp_threshold: float = DEFAULT_PSP_THRESHOLD,
+        cardiac_band: Tuple[float, float] = DEFAULT_CARDIAC_BAND,
+        filter_order: int = DEFAULT_FILTER_ORDER,
+        short_channels: Sequence[int] = (3, 5),  # CH3, CH5 = OctaMon short channels 4 & 6 (0-based)
+        exclude_failing_short_channels: bool = False,
+        reject_on_nan: bool = True,
+    ) -> None:
+        self.fs = fs
+        self.sci_threshold = sci_threshold
+        self.psp_threshold = psp_threshold
+        self.cardiac_band = tuple(cardiac_band)
+        self.filter_order = filter_order
+        self.short_channels = set(short_channels)
+        self.exclude_failing_short_channels = exclude_failing_short_channels
+        self.reject_on_nan = reject_on_nan
+
+    # ----- public API ----------------------------------------------------- #
+    def evaluate(self, data: pd.DataFrame) -> QualityReport:
+        """Score every channel found in ``data`` and return a report."""
+        channels = self._channel_wavelengths(data)
+        if not channels:
+            logger.warning("No 'CH{n}_WL{wl}' columns found for quality control.")
+            return QualityReport(sci_threshold=self.sci_threshold,
+                                 psp_threshold=self.psp_threshold)
+
+        report = QualityReport(sci_threshold=self.sci_threshold,
+                               psp_threshold=self.psp_threshold)
+        for channel in sorted(channels):
+            col1, col2 = channels[channel]
+            report.channels.append(
+                self._score_channel(channel, data[col1].to_numpy(), data[col2].to_numpy())
+            )
+        self._log(report)
+        return report
+
+    def apply(self, data: pd.DataFrame) -> Tuple[pd.DataFrame, QualityReport]:
+        """Evaluate quality and return ``(data_with_retained_channels, report)``.
+
+        Non-channel columns (metadata, events) are preserved; OD columns for
+        rejected channels are dropped.
+        """
+        report = self.evaluate(data)
+        keep_channels = set(report.retained_channels)
+        channel_cols = self._channel_wavelengths(data)
+
+        drop_cols: List[str] = []
+        for channel, (col1, col2) in channel_cols.items():
+            if channel not in keep_channels:
+                drop_cols.extend([col1, col2])
+
+        retained = data.drop(columns=drop_cols) if drop_cols else data.copy()
+        return retained, report
+
+    # ----- internals ------------------------------------------------------ #
+    def _score_channel(self, channel: int, wl1: np.ndarray, wl2: np.ndarray) -> ChannelQuality:
+        """Compute SCI/PSP for one channel and apply the pass/fail rules."""
+        is_short = channel in self.short_channels
+        sci = scalp_coupling_index(wl1, wl2, self.fs,
+                                   cardiac_band=self.cardiac_band,
+                                   filter_order=self.filter_order)
+        psp = peak_spectral_power(wl1, wl2, self.fs,
+                                  cardiac_band=self.cardiac_band,
+                                  filter_order=self.filter_order)
+
+        reasons: List[str] = []
+        if np.isnan(sci) or np.isnan(psp):
+            if self.reject_on_nan:
+                reasons.append("SCI/PSP could not be computed (NaN)")
+        else:
+            if sci < self.sci_threshold:
+                reasons.append(f"SCI {sci:.3f} < {self.sci_threshold:.2f}")
+            if psp < self.psp_threshold:
+                reasons.append(f"PSP {psp:.3f} < {self.psp_threshold:.2f}")
+
+        failed = bool(reasons)
+        if failed and is_short and not self.exclude_failing_short_channels:
+            # Short channel kept despite failing; record why it was spared.
+            return ChannelQuality(channel, True, sci, psp, passed=True,
+                                  reasons=("short channel kept despite: "
+                                           + "; ".join(reasons),))
+        return ChannelQuality(channel, is_short, sci, psp,
+                              passed=not failed, reasons=tuple(reasons))
+
+    def _channel_wavelengths(self, data: pd.DataFrame) -> Dict[int, Tuple[str, str]]:
+        """Map ``channel -> (wl1_col, wl2_col)`` from ``CH{n}_WL{wl}`` columns."""
+        by_channel: Dict[int, List[Tuple[int, str]]] = {}
+        for column in data.columns:
+            match = _CHANNEL_RE.fullmatch(str(column).strip())
+            if not match:
+                continue
+            channel, wavelength = int(match.group(1)), int(match.group(2))
+            by_channel.setdefault(channel, []).append((wavelength, column))
+
+        paired: Dict[int, Tuple[str, str]] = {}
+        for channel, entries in by_channel.items():
+            if len(entries) < 2:
+                logger.warning("Channel %d has %d wavelength column(s); skipping.",
+                               channel, len(entries))
+                continue
+            entries.sort()  # by wavelength ascending
+            paired[channel] = (entries[0][1], entries[1][1])
+        return paired
+
+    def _log(self, report: QualityReport) -> None:
+        """Log the summary and each rejection."""
+        logger.info("Channel QC: %s", report.summary_line())
+        for channel in report.rejected:
+            logger.warning("  REJECT CH%d  SCI=%.3f PSP=%.3f  (%s)",
+                           channel.channel, channel.sci, channel.psp,
+                           channel.reason_text)
