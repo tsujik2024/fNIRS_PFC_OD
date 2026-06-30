@@ -257,7 +257,7 @@ class FileProcessor:
 
         # Walking_DT with suffixes: DT-AC, DT-TMB, DT_DM, ST-AC, etc.
         # Match DT or ST followed by a hyphen or underscore and more letters
-        if re.search(r'(DT|ST)[_-][A-Z]', s):
+        if re.search(r'(DT|ST)[_-](AC|TMB|DM)\b', s):
             logger.debug(f"Timing: 90s (DT/ST variant task)")
             return {
                 "baseline_duration": 20.0,
