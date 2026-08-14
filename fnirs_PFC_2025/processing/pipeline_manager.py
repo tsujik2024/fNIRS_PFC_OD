@@ -1,24 +1,10 @@
-"""End-to-end study orchestration.
-
-:class:`PipelineManager` is the top-level workflow. It delegates execution to
-:class:`BatchProcessor` (which runs SCI/PSP channel quality control before the
-pipeline) and aggregation to :class:`StatsCollector`. Because
-:class:`FileProcessor` renders its plots while processing, consistent
-per-subject y-limits are achieved with two passes: an initial pass to derive the
-limits from the processed data, then a second pass that re-renders with those
-limits. Pass 2 is skipped when ``consistent_ylimits`` is ``False``.
-
-It also writes a study-wide QC roll-up (``qc_summary_all_recordings.csv``) so the
-SCI/PSP rejection outcome for every recording is captured in one place.
-"""
-
 from __future__ import annotations
 
 import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -26,6 +12,7 @@ from fnirs_PFC_2025.processing.batch_processor import BatchProcessor, BatchResul
 from fnirs_PFC_2025.processing.quality_control import (
     DEFAULT_PSP_THRESHOLD,
     DEFAULT_SCI_THRESHOLD,
+    DEFAULT_SQI_THRESHOLD,
 )
 from fnirs_PFC_2025.processing.stats_collector import StatsCollector
 
@@ -34,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StudyResult:
-    """Everything a study run produces, for programmatic use after the fact."""
+    """Everything a run produces btw"""
 
     batch: BatchResult
     stats_raw: Optional[pd.DataFrame] = None
@@ -53,31 +40,50 @@ class StudyResult:
 
 
 class PipelineManager:
-    """Run a whole study: QC + process -> y-limits -> statistics -> reports."""
+    """Run a whole study: process (with quality control) -> y-limits -> statistics -> reports."""
 
     def __init__(
         self,
         fs: float = 50.0,
+        sqi_threshold: float = DEFAULT_SQI_THRESHOLD,
         sci_threshold: float = DEFAULT_SCI_THRESHOLD,
         psp_threshold: float = DEFAULT_PSP_THRESHOLD,
-        post_walking_trim_seconds: float = 3.0,
-        sqi_threshold: float = 2.0,
-        enable_sqi_filtering: bool = False,
-        short_channels: Sequence[int] = (3, 5),  # CH3, CH5 (0-based) = short channels 4 & 6
+        enabled_metrics: Tuple[str, ...] = ("sci", "psp"),
+        enable_quality_filtering: bool = True,
         exclude_failing_short_channels: bool = False,
+        post_walking_trim_seconds: float = 3.0,
+        initial_crop_seconds: float = 1.0,
     ) -> None:
+        """
+        Args:
+            fs: Sampling frequency in Hz
+            sqi_threshold, sci_threshold, psp_threshold: per-metric thresholds,
+                passed straight through to BatchProcessor -> FileProcessor.
+            enabled_metrics: which of "sqi", "sci", "psp" gate channel exclusion.
+                Default ("sci", "psp") - SQI is opt-in.
+            enable_quality_filtering: if True (default), channels failing an
+                enabled metric are dropped; if False, quality is still computed
+                and reported but nothing is removed.
+            exclude_failing_short_channels: if True, short channels (CH3/CH5)
+                that fail are also dropped, instead of being spared by default.
+            post_walking_trim_seconds: seconds to trim after walking start event.
+            initial_crop_seconds: seconds to drop from the start of every
+                recording (device/initialization artifacts). Default 1.0s,
+                matching FullCapProcessor's initial crop.
+        """
         self.fs = fs
         self._batch = BatchProcessor(
             fs=fs,
+            sqi_threshold=sqi_threshold,
             sci_threshold=sci_threshold,
             psp_threshold=psp_threshold,
-            post_walking_trim_seconds=post_walking_trim_seconds,
-            sqi_threshold=sqi_threshold,
-            enable_sqi_filtering=enable_sqi_filtering,
-            short_channels=short_channels,
+            enabled_metrics=enabled_metrics,
+            enable_quality_filtering=enable_quality_filtering,
             exclude_failing_short_channels=exclude_failing_short_channels,
+            post_walking_trim_seconds=post_walking_trim_seconds,
+            initial_crop_seconds=initial_crop_seconds,
         )
-        self._stats = StatsCollector(fs=fs)
+        self._stats = StatsCollector(fs=fs, enable_quality_filtering=enable_quality_filtering)
 
     def run(
         self,
@@ -90,7 +96,7 @@ class PipelineManager:
         """Execute the full study workflow and return a :class:`StudyResult`."""
         os.makedirs(output_dir, exist_ok=True)
 
-        logger.info("Pass 1: channel QC + initial processing.")
+        logger.info("Pass 1: processing (quality control runs inside FileProcessor).")
         batch = self._batch.process(
             input_dir, output_dir, task_filter=task_filter, show_progress=show_progress
         )
@@ -144,11 +150,18 @@ class PipelineManager:
 
     # ----- QC roll-up ----------------------------------------------------- #
     def _write_qc_summary(self, batch: BatchResult, output_dir: str) -> Optional[Path]:
-        """Write one row per recording summarising SCI/PSP channel-quality outcomes."""
+        """Write one row per recording summarising quality-filtering outcomes.
+
+        Unchanged from before the quality-control consolidation: QualityReport
+        still exposes .channels / .retained / .rejected / .n_long_retained /
+        .n_long_total, now populated by FileProcessor instead of the old
+        external ChannelQualityControl prefilter.
+        """
         rows = []
         for file_path, report in batch.qc_reports.items():
             rows.append({
                 "Recording": os.path.splitext(os.path.basename(file_path))[0],
+                "Metrics used": "+".join(report.metrics_used) or "none",
                 "Channels retained": len(report.retained),
                 "Channels total": len(report.channels),
                 "Long retained": report.n_long_retained,
