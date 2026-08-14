@@ -1,0 +1,46 @@
+"""Scalp Coupling Index (SCI).
+Reference:
+    Pollonini, L., Olds, C., Abaya, H., Bortfeld, H., Beauchamp, M. S., &
+    Oghalai, J. S. (2014). Auditory cortex activation to natural speech and
+    simulated cochlear implant speech measured with functional near-infrared
+    spectroscopy. Hearing Research, 309, 84-93.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from scipy.signal import butter, filtfilt
+
+
+def scalp_coupling_index(
+    od_wl1: np.ndarray,
+    od_wl2: np.ndarray,
+    fs: float,
+    cardiac_band: tuple[float, float] = (0.5, 2.5),
+    filter_order: int = 4,
+) -> float:
+    
+    x1 = np.asarray(od_wl1, dtype=float).ravel()
+    x2 = np.asarray(od_wl2, dtype=float).ravel()
+    if x1.shape != x2.shape:
+        raise ValueError("Inputs must be the same length")
+    if not (np.all(np.isfinite(x1)) and np.all(np.isfinite(x2))):
+        return float("nan")
+
+    nyq = fs / 2.0
+    low, high = cardiac_band
+    if not 0 < low < high < nyq:
+        raise ValueError(
+            f"Invalid cardiac band {cardiac_band} for fs={fs} (Nyquist={nyq})"
+        )
+
+    b, a = butter(filter_order, [low / nyq, high / nyq], btype="band")
+    f1 = filtfilt(b, a, x1)
+    f2 = filtfilt(b, a, x2)
+
+    f1 -= f1.mean()
+    f2 -= f2.mean()
+    denom = float(np.sqrt(np.sum(f1 ** 2) * np.sum(f2 ** 2)))
+    if denom == 0:
+        return float("nan")
+    return float(np.sum(f1 * f2) / denom)
