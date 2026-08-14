@@ -11,18 +11,7 @@ def baseline_subtraction(
         events_df: pd.DataFrame,
         baseline_type: str = "long_walk"  # "long_walk", "event_based" (aka S1→S2), or "lshape_task"
 ) -> pd.DataFrame:
-    """
-    Baseline-subtract fNIRS signals using trimmed mean (10% each tail).
-    Supports:
-      - "long_walk":      S1 → W1   (fallback: S1 → S2 if W1 missing)
-      - "event_based":    S1 → S2
-      - "lshape_task":    use explicit 'BaselineStart'/'BaselineEnd' provided by caller
-    If 'BaselineStart'/'BaselineEnd' are present in events_df, they take precedence.
-
-    Notes:
-      - Only HbO/O2Hb and HbR/HHb channel columns are baseline-subtracted.
-      - Sample numbers are treated as **indices** (0-based), end is **exclusive**.
-    """
+    
     if events_df is None or events_df.empty:
         raise ValueError("No events dataframe provided for baseline subtraction.")
 
@@ -119,16 +108,11 @@ def baseline_subtraction(
             logger.warning(f"Baseline window is empty/NaN for {ch}; skipping baseline subtraction for this channel.")
             continue
 
-        # Guard for tiny windows: trim_mean handles small n (trimming may be 0)
         trimmed_mean = stats.trim_mean(base_vals, proportiontocut=0.10)
         if not np.isfinite(trimmed_mean):
             # Fallback to simple mean if trimming produced non-finite value
             trimmed_mean = float(base_vals.mean())
 
         corrected[ch] = corrected[ch].astype(float) - trimmed_mean
-
-        # Optional debug
-        # regular_mean = float(base_vals.mean())
-        # logger.debug(f"{ch}: mean={regular_mean:.6f}, trimmed={trimmed_mean:.6f}")
 
     return corrected
