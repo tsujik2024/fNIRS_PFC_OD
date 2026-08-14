@@ -14,35 +14,72 @@ from fnirs_PFC_2025.preprocessing.tddr import tddr
 from fnirs_PFC_2025.preprocessing.baseline_correction import baseline_subtraction
 from fnirs_PFC_2025.preprocessing.average_channels import average_channels
 from fnirs_PFC_2025.preprocessing.signalqualityindex import SQI, fir_filter as sqi_fir_filter
+from fnirs_PFC_2025.preprocessing.sci import scalp_coupling_index
+from fnirs_PFC_2025.preprocessing.psp import peak_spectral_power
+from fnirs_PFC_2025.processing.quality_control import (
+    ChannelQuality, QualityReport,
+    DEFAULT_SQI_THRESHOLD, DEFAULT_SCI_THRESHOLD, DEFAULT_PSP_THRESHOLD,
+)
 # Import plotting functions
 from fnirs_PFC_2025.viz.plots import plot_channels_separately, plot_overall_signals
 
 logger = logging.getLogger(__name__)
 plt.ioff()  # Non-interactive backend
 
-# Short channel IDs to exclude from averaging (consistent with average_channels.py)
-SHORT_CHANNEL_IDS = {2, 6}
+# Short channel IDs to exclude from averaging/regression grouping.
+# 0-based channel indices. Project convention (see quality_control.py,
+# BatchProcessor, PipelineManager): the OctaMon short channels labelled
+# 4 and 6 in 1-based optode numbering are CH3 and CH5 here (0-based).
+SHORT_CHANNEL_IDS = {3, 5}
 
 
 class FileProcessor:
-    """Handles processing of individual fNIRS files through the complete pipeline with CV filtering and post-walking trimming options."""
 
-    def __init__(self, fs: float = 50.0, sqi_threshold: float = 2.0,
-                 enable_sqi_filtering: bool = False,
-                 post_walking_trim_seconds: float = 3.0):
+    def __init__(self, fs: float = 50.0,
+                 sqi_threshold: float = DEFAULT_SQI_THRESHOLD,
+                 sci_threshold: float = DEFAULT_SCI_THRESHOLD,
+                 psp_threshold: float = DEFAULT_PSP_THRESHOLD,
+                 enabled_metrics: Tuple[str, ...] = ("sci", "psp"),
+                 enable_quality_filtering: bool = True,
+                 exclude_failing_short_channels: bool = False,
+                 post_walking_trim_seconds: float = 3.0,
+                 initial_crop_seconds: float = 1.0):
         """
         Initialize processor with parameters.
 
         Args:
             fs: Sampling frequency in Hz
-            sqi_threshold: SQI threshold for quality assessment (1-5 scale, default 2.5)
-            enable_sqi_filtering: If True, exclude channels with SQI < threshold from analysis
+            sqi_threshold: SQI threshold for quality assessment (1-5 scale, default 2.0)
+            sci_threshold: Scalp Coupling Index threshold (default 0.75, Pollonini/PHOEBE)
+            psp_threshold: Peak Spectral Power threshold (default 0.10, Pollonini/PHOEBE)
+            enabled_metrics: which of "sqi", "sci", "psp" participate in the pass/fail
+                decision. Metrics not listed here are not computed at all. Default
+                ("sci", "psp") - SQI is opt-in.
+            enable_quality_filtering: If True (default), channels that fail an enabled
+                metric are dropped from SCR/FIR/baseline/output. If False, quality is
+                still computed and reported, but no channels are removed.
+            exclude_failing_short_channels: If True, short channels (CH3/CH5) that fail
+                are also dropped. Default False - short channels are kept regardless of
+                quality since they're used as SCR regressors, not signal.
             post_walking_trim_seconds: Seconds to trim after walking start event for quality control (default 3.0)
+            initial_crop_seconds: Seconds to drop from the START of every recording
+                (device/initialization artifacts), applied before anything else - events,
+                quality metrics, TDDR, etc. all see the already-cropped recording.
+                Default 1.0s, matching FullCapProcessor's initial crop.
         """
         self.fs = fs
         self.sqi_threshold = sqi_threshold
-        self.enable_sqi_filtering = enable_sqi_filtering
+        self.sci_threshold = sci_threshold
+        self.psp_threshold = psp_threshold
+        self.enabled_metrics = tuple(m.lower() for m in enabled_metrics)
+        invalid = set(self.enabled_metrics) - {"sqi", "sci", "psp"}
+        if invalid:
+            raise ValueError(f"Unknown quality metric(s) {invalid}; expected a subset of "
+                             f"{{'sqi', 'sci', 'psp'}}.")
+        self.enable_quality_filtering = enable_quality_filtering
+        self.exclude_failing_short_channels = exclude_failing_short_channels
         self.post_walking_trim_seconds = post_walking_trim_seconds
+        self.initial_crop_seconds = initial_crop_seconds
 
         # Define task types and their walking start events
         self.task_walking_events = {
@@ -72,12 +109,14 @@ class FileProcessor:
             'Navigation': {'type': 'event_dependent', 'min_events': 2},
         }
 
-        filter_status = "ENABLED" if enable_sqi_filtering else "DISABLED"
-        logger.info(f"Initialized FileProcessor (fs={fs}, SQI threshold={sqi_threshold}, "
-                    f"SQI filtering={filter_status}, post-walking trim={post_walking_trim_seconds}s)")
+        filter_status = "ENABLED" if enable_quality_filtering else "DISABLED"
+        logger.info(f"Initialized FileProcessor (fs={fs}, metrics={self.enabled_metrics}, "
+                    f"thresholds: SQI>={sqi_threshold} SCI>={sci_threshold} PSP>={psp_threshold}, "
+                    f"quality filtering={filter_status}, initial crop={initial_crop_seconds}s, "
+                    f"post-walking trim={post_walking_trim_seconds}s)")
 
     def _is_short_channel(self, col_name: str) -> bool:
-        """Check if a column belongs to a short channel (CH2 or CH6)."""
+        """Check if a column belongs to a short channel (CH3 or CH5, i.e. 1-based optodes 4 and 6)."""
         match = re.match(r'CH(\d+)', str(col_name))
         if match:
             ch_num = int(match.group(1))
@@ -86,7 +125,7 @@ class FileProcessor:
 
     def _get_long_channel_cols(self, columns: List[str], chromophore: str = 'both') -> List[str]:
         """
-        Get column names for long channels only (excluding short channels CH2, CH6).
+        Get column names for long channels only (excluding short channels CH3, CH5).
 
         Args:
             columns: List of column names to filter
@@ -132,6 +171,7 @@ class FileProcessor:
         """
         try:
             self._event_index_remap = None
+            self._last_quality_report = None
             # ─── Setup paths & names ───────────────────────────
             output_dir = self._create_output_dir(output_base_dir, input_base_dir, file_path)
             file_basename = os.path.basename(file_path)
@@ -141,7 +181,7 @@ class FileProcessor:
             # Store file_basename for use in fallback timing
             self._current_file_basename = file_basename
 
-            logger.info(f" Starting: {file_path} (SQI filtering: {'ON' if self.enable_sqi_filtering else 'OFF'}, "
+            logger.info(f" Starting: {file_path} (quality filtering: {'ON' if self.enable_quality_filtering else 'OFF'}, "
                         f"post-walking trim: {self.post_walking_trim_seconds}s)")
 
             # ─── 1) Load raw data ───────────────────────────────
@@ -161,6 +201,15 @@ class FileProcessor:
                 return {'success': False, 'error': 'Prepared data is empty'}
 
             logger.debug(f" Loaded {len(data)} rows × {len(data.columns)} cols")
+
+            # Drop the first `initial_crop_seconds` of the recording (device/
+            # initialization artifacts), matching FullCapProcessor. Everything
+            # downstream - event extraction, quality metrics, TDDR, etc. - sees
+            # only the already-cropped recording.
+            data = self._drop_initial_seconds(data, self.initial_crop_seconds)
+            if data is None or data.empty:
+                logger.error(f" Data empty after initial-seconds crop for: {file_path}")
+                return {'success': False, 'error': 'Data empty after initial-seconds crop'}
 
             # ─── 2) Metadata ────────────────────────────────────
             metadata = data_dict.get('metadata', {})
@@ -190,7 +239,7 @@ class FileProcessor:
 
             # ─── 6) Processing pipeline with SQI filtering ───────
             # NOTE: "Raw" concentration plotting now happens INSIDE _process_pipeline_stages
-            # after Beer-Lambert conversion but before SCR/filtering
+            # after Beer-Lambert conversion (pre-TDDR) but before TDDR/SCR/filtering
             processed_data = self._process_pipeline_stages(
                 data=data,
                 output_dir=output_dir,
@@ -220,7 +269,8 @@ class FileProcessor:
                 'data': final_df,
                 'subject': subject,
                 'task_type': task_type,
-                'output_dir': output_dir
+                'output_dir': output_dir,
+                'quality': getattr(self, '_last_quality_report', None),
             }
 
         except Exception as e:
@@ -292,7 +342,11 @@ class FileProcessor:
                                  task_type: str = None,
                                  subject: str = None,
                                  global_ylim: Optional[Tuple[float, float]] = None) -> Optional[pd.DataFrame]:
-        """Process data through all pipeline stages with proper column handling for loader-renamed columns."""
+        """Process data through all pipeline stages with proper column handling for loader-renamed columns.
+
+        Pipeline order (matches FullCapProcessor): SQI (pre-TDDR) -> TDDR ->
+        OD-to-concentration (post-TDDR) -> SCR -> FIR -> baseline -> trim.
+        """
         # ====== DIAGNOSTIC: Check input OD values ======
         od_cols = [col for col in data.columns
                    if any(kw in col for kw in ['WL', 'wavelength'])
@@ -361,32 +415,46 @@ class FileProcessor:
             logger.error(" No valid channels with 2 wavelengths found")
             return None
 
-        # 1) CONVERT OD TO CONCENTRATION FIRST
-        logger.info("Converting OD to concentration")
-        concentration_data = self._convert_od_to_concentration(data, od_cols, valid_channels)
+        # ─────────────────────────────────────────────────────────────────────────
+        # PIPELINE ORDER (matches FullCapProcessor):
+        #   quality metrics -> TDDR -> OD-to-concentration -> SCR -> FIR -> baseline
+        #
+        # SQI is computed on the PRE-TDDR signal, because TDDR is a
+        # motion-correction step and SQI is designed to detect exactly the
+        # artifacts TDDR removes; evaluating post-TDDR would systematically
+        # inflate the score. The "raw" concentration plot is likewise
+        # pre-TDDR, since it's meant to show the minimally processed signal.
+        # TDDR is then applied to the OD, concentration is re-derived from the
+        # corrected OD, and that post-TDDR concentration feeds SCR / FIR /
+        # baseline / the final output.
+        # ─────────────────────────────────────────────────────────────────────────
 
-        if concentration_data is None or concentration_data.empty:
+        # 1) CONVERT OD TO CONCENTRATION (PRE-TDDR) — used for SQI + "raw" plot
+        logger.info("Converting pre-TDDR OD to concentration (for SQI + raw plotting)")
+        concentration_data_pre_tddr = self._convert_od_to_concentration(data, od_cols, valid_channels)
+
+        if concentration_data_pre_tddr is None or concentration_data_pre_tddr.empty:
             logger.error(" Failed to convert OD to concentration")
             return None
 
-        logger.info(f" Converted to concentration: {len(concentration_data.columns)} columns")
+        logger.info(f" Converted to pre-TDDR concentration: {len(concentration_data_pre_tddr.columns)} columns")
 
         # ─────────────────────────────────────────────────────────────────────────
         # DIAGNOSTIC: Store data at each processing stage for comparison plots
         # ─────────────────────────────────────────────────────────────────────────
         diagnostic_stages = {}
 
-        # Stage 1: Post-MBLL (raw concentration)
-        diagnostic_stages["1_Post-MBLL"] = concentration_data.copy()
+        # Stage 1: Post-MBLL, pre-TDDR (raw concentration)
+        diagnostic_stages["1_Post-MBLL"] = concentration_data_pre_tddr.copy()
 
         # ─────────────────────────────────────────────────────────────────────────
-        # 1.5) PLOT "RAW" CONCENTRATION DATA (post-Beer-Lambert, pre-SCR/filtering)
+        # 1.5) PLOT "RAW" CONCENTRATION DATA (post-Beer-Lambert, pre-TDDR/SCR/filtering)
         # This is the "minimally processed" data showing physiologically meaningful
         # concentrations before signal processing removes noise/artifacts
         # ─────────────────────────────────────────────────────────────────────────
         self._plot_raw_concentration_data(
             data=data,
-            concentration_data=concentration_data,
+            concentration_data=concentration_data_pre_tddr,
             output_dir=output_dir,
             file_basename=file_basename,
             subject=subject,
@@ -395,12 +463,31 @@ class FileProcessor:
             events=events
         )
 
-        # 2) Calculate SQI using BOTH OD data and concentration data
-        excluded_channels = self._calculate_sqi_quality_and_filter(
-            data, valid_channels, output_dir, file_basename, concentration_data
+        # 2) Calculate quality (any combination of SQI/SCI/PSP per enabled_metrics)
+        #    using the PRE-TDDR OD and PRE-TDDR concentration data.
+        excluded_channels, quality_report = self._calculate_quality_and_filter(
+            data, valid_channels, output_dir, file_basename, concentration_data_pre_tddr
         )
+        self._last_quality_report = quality_report
 
-        # 3) Build working dataframe - START FRESH with only metadata + concentration
+        # 3) APPLY TDDR to the OD signals, then re-derive concentration from the
+        #    corrected OD.
+        logger.info("Applying TDDR motion correction to OD signals")
+        data_tddr = self._apply_tddr(data)
+
+        logger.info("Re-converting TDDR-corrected OD to concentration")
+        concentration_data = self._convert_od_to_concentration(data_tddr, od_cols, valid_channels)
+
+        if concentration_data is None or concentration_data.empty:
+            logger.error(" Failed to convert TDDR-corrected OD to concentration")
+            return None
+
+        logger.info(f" Converted post-TDDR concentration: {len(concentration_data.columns)} columns")
+
+        # Stage 2: Post-TDDR concentration
+        diagnostic_stages["2_Post-TDDR"] = concentration_data.copy()
+
+        # 4) Build working dataframe - START FRESH with only metadata + concentration
         logger.info(" Building working dataframe with ONLY concentration data")
 
         # CRITICAL: Start with ONLY metadata columns, NO OD columns
@@ -415,16 +502,16 @@ class FileProcessor:
         working_data = data[metadata_cols].copy()
         logger.info(f"Started with {len(metadata_cols)} metadata columns: {metadata_cols}")
 
-        # Add ONLY concentration columns (NOT OD columns!)
         for col in concentration_data.columns:
             working_data[col] = concentration_data[col]
 
         logger.info(f"Added {len(concentration_data.columns)} concentration columns")
         logger.info(f"Working data now has {len(working_data.columns)} total columns")
 
-        # 4) Apply SQI filtering if enabled
-        if self.enable_sqi_filtering and excluded_channels:
-            logger.info(f" SQI filtering enabled: Excluding {len(excluded_channels)} channels")
+        # 5) Apply quality filtering if enabled (exclusions were computed pre-TDDR,
+        #    using whichever of SQI/SCI/PSP are in self.enabled_metrics)
+        if self.enable_quality_filtering and excluded_channels:
+            logger.info(f" Quality filtering enabled: Excluding {len(excluded_channels)} channels")
 
             # Determine which concentration columns to exclude based on OD channel exclusions
             concentration_cols_to_exclude = []
@@ -439,9 +526,9 @@ class FileProcessor:
             if concentration_cols_to_exclude:
                 concentration_cols_to_exclude = list(set(concentration_cols_to_exclude))
                 working_data = working_data.drop(columns=concentration_cols_to_exclude)
-                logger.info(f"Excluded {len(concentration_cols_to_exclude)} concentration columns based on SQI")
+                logger.info(f"Excluded {len(concentration_cols_to_exclude)} concentration columns based on quality metrics")
         else:
-            logger.info(f" SQI filtering disabled: Using all {len(concentration_data.columns)} concentration channels")
+            logger.info(f" Quality filtering disabled or nothing to exclude: Using all {len(concentration_data.columns)} concentration channels")
 
         # Get concentration signal columns for further processing
         signal_cols = [col for col in working_data.columns
@@ -463,7 +550,6 @@ class FileProcessor:
             logger.error(f"   Expected: -10 to +10 µM typically")
             logger.error(f"   This indicates OD data is being used instead of concentration!")
 
-            # Debug: Show what columns are in working_data
             logger.error(f"   Working data columns: {list(working_data.columns)}")
 
             # Check if any OD columns snuck in
@@ -476,18 +562,18 @@ class FileProcessor:
 
         # ─── CONCENTRATION PROCESSING PIPELINE ──────────────────────────────────
 
-        # 5) SCR (on concentration data)
+        # 6) SCR (on post-TDDR concentration data)
         scr_data = self._apply_scr(signal_slice)
 
-        # Stage 2: Post-SCR
-        diagnostic_stages["2_Post-SCR"] = scr_data.copy()
+        # Stage 3: Post-SCR
+        diagnostic_stages["3_Post-SCR"] = scr_data.copy()
 
-        # 6) FIR FILTERING (on concentration data)
+        # 7) FIR FILTERING (on concentration data)
         logger.info("Applying FIR bandpass filter to concentration data (0.01-0.1 Hz)")
         fir_filtered_data = self._apply_fir_filter(scr_data)
 
-        # Stage 3: Post-Filter
-        diagnostic_stages["3_Post-Filter"] = fir_filtered_data.copy()
+        # Stage 4: Post-Filter
+        diagnostic_stages["4_Post-Filter"] = fir_filtered_data.copy()
 
         # Replace ONLY the concentration columns in working_data with filtered versions
         for col in fir_filtered_data.columns:
@@ -495,17 +581,17 @@ class FileProcessor:
 
         logger.info(f"Applied filtering to {len(fir_filtered_data.columns)} concentration channels")
 
-        # 7) Baseline Correction
+        # 8) Baseline Correction
         baseline_corrected = self._apply_baseline_correction(working_data, events, task_type)
 
         if baseline_corrected is not None:
-            # Stage 4: Post-Baseline
+            # Stage 5: Post-Baseline
             # Extract just the signal columns for the diagnostic
             bc_signal_cols = [col for col in baseline_corrected.columns
                               if any(kw in col for kw in ['HbO', 'HbR', 'O2Hb', 'HHb'])
                               and pd.api.types.is_numeric_dtype(baseline_corrected[col])]
             if bc_signal_cols:
-                diagnostic_stages["4_Post-Baseline"] = baseline_corrected[bc_signal_cols].copy()
+                diagnostic_stages["5_Post-Baseline"] = baseline_corrected[bc_signal_cols].copy()
 
             # ─────────────────────────────────────────────────────────────────────
             # CREATE DIAGNOSTIC PLOTS FOR EACH STAGE
@@ -535,7 +621,7 @@ class FileProcessor:
                 events=events
             )
 
-            # 8) Apply post-event trimming
+            # 9) Apply post-event trimming
             trimmed_data = self._apply_post_event_trimming(baseline_corrected, events, task_type)
 
             # Final verification
@@ -564,12 +650,10 @@ class FileProcessor:
                                      condition: str,
                                      events: Optional[pd.DataFrame] = None) -> None:
         """
-        Plot "raw" concentration data - post-Beer-Lambert conversion, pre-SCR/filtering.
+        Plot "raw" concentration data - post-Beer-Lambert conversion, pre-TDDR/SCR/filtering.
 
-        This shows the minimally processed data in physiologically meaningful units (µM)
-        before signal processing steps remove noise and artifacts.
 
-        Note: Short channels (CH2, CH6) are excluded from averaging to match final output.
+        Note: Short channels (CH3, CH5) are excluded from averaging to match final output.
 
         Args:
             data: Original data with metadata columns (Sample number, Time, Event)
@@ -581,7 +665,7 @@ class FileProcessor:
             condition: Task type/condition label
             events: Optional event markers DataFrame
         """
-        # Find HbO and HbR columns, EXCLUDING short channels
+        # Find HbO and HbR columns, exclude short channels
         o2hb_cols = self._get_long_channel_cols(concentration_data.columns, 'oxy')
         hhb_cols = self._get_long_channel_cols(concentration_data.columns, 'deoxy')
         combined_cols = o2hb_cols + hhb_cols
@@ -591,16 +675,16 @@ class FileProcessor:
             return
 
         logger.info(
-            f" Raw concentration plot using {len(o2hb_cols)} HbO and {len(hhb_cols)} HbR long channels (excluding CH2, CH6)")
+            f" Raw concentration plot using {len(o2hb_cols)} HbO and {len(hhb_cols)} HbR long channels (excluding CH3, CH5)")
 
         # Create condition-specific output directory
         condition_dir = os.path.join(output_dir, condition)
         os.makedirs(condition_dir, exist_ok=True)
 
-        # Build a combined DataFrame for plotting
+        # Build a combined df for plotting
         plot_df = concentration_data[combined_cols].copy()
 
-        # Add time information
+        # aDdd time information
         if 'Time (s)' in data.columns:
             plot_df['Time (s)'] = data['Time (s)'].values
         else:
@@ -678,7 +762,7 @@ class FileProcessor:
         """
         Plot data at a specific processing stage for diagnostic purposes.
 
-        Note: Short channels (CH2, CH6) are excluded from averaging to match final output.
+        Note: Short channels (CH3, CH5) are excluded from averaging to match final output.
 
         Args:
             data: DataFrame with HbO/HbR concentration columns
@@ -686,7 +770,7 @@ class FileProcessor:
             file_basename: Base filename for plot naming
             subject: Subject identifier
             condition: Task type/condition label
-            stage_name: Human-readable name for this stage (e.g., "Post-SCR")
+            stage_name: e.g., "Post-SCR"
             stage_number: Numeric stage identifier for ordering (1, 2, 3, etc.)
             events: Optional event markers DataFrame
         """
@@ -758,7 +842,7 @@ class FileProcessor:
         """
         Create a multi-panel summary plot showing all processing stages side by side.
 
-        Note: Short channels (CH2, CH6) are excluded from averaging to match final output.
+        Note: Short channels (CH3, CH5) are excluded from averaging to match final output.
 
         Args:
             stages_data: Dict mapping stage names to DataFrames
@@ -781,7 +865,7 @@ class FileProcessor:
             axes = [axes]
 
         fig.suptitle(
-            f"{file_basename} - Processing Pipeline Stages\nSubject: {subject}\n(Long channels only, excluding CH2 & CH6)",
+            f"{file_basename} - Processing Pipeline Stages\nSubject: {subject}\n(Long channels only, excluding CH3 & CH5)",
             fontsize=12)
 
         # Clean events once
@@ -1039,162 +1123,399 @@ class FileProcessor:
         logger.warning(f" Could not find walking start event for {task_type}")
         return None
 
-    def _calculate_sqi_quality_and_filter(self, data: pd.DataFrame,
-                                          channel_groups: dict,
-                                          output_dir: str, file_basename: str,
-                                          concentration_data: pd.DataFrame) -> List[str]:
-        """Calculate SQI quality metrics using BOTH OD data and REAL concentration data."""
-        all_channels = []
-        flagged = []
-        excluded_channels = []
+    def _calculate_quality_and_filter(self, data: pd.DataFrame,
+                                      channel_groups: dict,
+                                      output_dir: str, file_basename: str,
+                                      concentration_data: pd.DataFrame) -> Tuple[List[str], QualityReport]:
+        """Calculate channel quality using whichever of SQI/SCI/PSP are in
+        `self.enabled_metrics`, all computed on PRE-TDDR OD (+ PRE-TDDR
+        concentration, for SQI only). A channel fails if ANY enabled,
+        successfully-computed metric fails its threshold. Short channels are
+        spared from exclusion unless `exclude_failing_short_channels=True`.
 
-        logger.info(f" SQI calculation using both OD and concentration data for {file_basename}")
-        logger.info(f"   SQI threshold: {self.sqi_threshold}")
-        logger.info(f"   Enable SQI filtering: {self.enable_sqi_filtering}")
+        Returns
+        -------
+        (excluded_od_columns, quality_report)
+            excluded_od_columns : OD column names for channels that should be
+                dropped downstream (empty unless enable_quality_filtering=True).
+            quality_report : QualityReport with one ChannelQuality per channel,
+                for logging/CSV output and for the caller (process_file) to
+                surface to BatchProcessor/PipelineManager.
+        """
+        report = QualityReport(
+            metrics_used=self.enabled_metrics,
+            sqi_threshold=self.sqi_threshold,
+            sci_threshold=self.sci_threshold,
+            psp_threshold=self.psp_threshold,
+        )
+        excluded_channels: List[str] = []
+
+        logger.info(f" Quality calculation ({'+'.join(self.enabled_metrics) or 'none'}) for {file_basename}")
+        logger.info(f"   Thresholds: SQI>={self.sqi_threshold} SCI>={self.sci_threshold} PSP>={self.psp_threshold}")
+        logger.info(f"   Quality filtering: {self.enable_quality_filtering} "
+                    f"(exclude failing short channels: {self.exclude_failing_short_channels})")
         logger.info(f"   Total channels to evaluate: {len(channel_groups)}")
 
-        for ch_id, wavelengths in channel_groups.items():
-            if len(wavelengths) == 2:
-                wl_keys = list(wavelengths.keys())
-                od1_col = wavelengths[wl_keys[0]]
-                od2_col = wavelengths[wl_keys[1]]
+        for ch_id_str, wavelengths in channel_groups.items():
+            ch_num = int(re.match(r'CH(\d+)', ch_id_str).group(1))
+            is_short = ch_num in SHORT_CHANNEL_IDS
 
-                od1_signal = data[od1_col].to_numpy(dtype=np.float64)
-                od2_signal = data[od2_col].to_numpy(dtype=np.float64)
+            if len(wavelengths) != 2:
+                logger.warning(f" Channel {ch_id_str} has {len(wavelengths)} wavelength(s), need 2 for quality metrics")
+                cq = ChannelQuality(ch_num, is_short, passed=False,
+                                    reasons=("insufficient wavelengths",))
+                report.channels.append(cq)
+                if self.enable_quality_filtering and not (is_short and not self.exclude_failing_short_channels):
+                    excluded_channels.extend(list(wavelengths.values()))
+                continue
 
-                try:
-                    oxy_col = None
-                    deoxy_col = None
+            wl_keys = list(wavelengths.keys())
+            od1_col, od2_col = wavelengths[wl_keys[0]], wavelengths[wl_keys[1]]
+            od1_signal = data[od1_col].to_numpy(dtype=np.float64)
+            od2_signal = data[od2_col].to_numpy(dtype=np.float64)
 
+            sqi_val = sci_val = psp_val = None
+            reasons: List[str] = []
+
+            try:
+                if "sqi" in self.enabled_metrics:
+                    oxy_col = deoxy_col = None
                     for col in concentration_data.columns:
-                        if ch_id in col:
+                        if ch_id_str in col:
                             if any(kw in col for kw in ['HbO', 'O2Hb']):
                                 oxy_col = col
                             elif any(kw in col for kw in ['HbR', 'HHb']):
                                 deoxy_col = col
-
-                    if oxy_col and deoxy_col and oxy_col in concentration_data.columns and deoxy_col in concentration_data.columns:
+                    if oxy_col and deoxy_col:
                         oxy_signal = concentration_data[oxy_col].to_numpy(dtype=np.float64)
                         deoxy_signal = concentration_data[deoxy_col].to_numpy(dtype=np.float64)
-                        logger.debug(f"Using real concentration data for {ch_id}: {oxy_col}, {deoxy_col}")
                     else:
-                        logger.warning(f"No concentration data found for {ch_id}, using OD data as proxy for SQI")
-                        oxy_signal = od1_signal
-                        deoxy_signal = od2_signal
+                        logger.warning(f"No concentration data found for {ch_id_str}, using OD data as proxy for SQI")
+                        oxy_signal, deoxy_signal = od1_signal, od2_signal
 
-                    sqi_score = SQI(od1_signal, od2_signal, oxy_signal, deoxy_signal, self.fs)
+                    sqi_val = float(SQI(od1_signal, od2_signal, oxy_signal, deoxy_signal, self.fs))
+                    if np.isnan(sqi_val):
+                        reasons.append("SQI could not be computed (NaN)")
+                    elif sqi_val < self.sqi_threshold:
+                        reasons.append(f"SQI {sqi_val:.2f} < {self.sqi_threshold:.2f}")
 
-                    if np.isnan(sqi_score):
-                        logger.warning(f"SQI calculation returned NaN for {ch_id}")
-                        flagged.append((ch_id, 1.0, 'SQI_NAN'))
-                        if self.enable_sqi_filtering:
-                            excluded_channels.extend(list(wavelengths.values()))
-                        continue
+                if "sci" in self.enabled_metrics:
+                    sci_val = float(scalp_coupling_index(od1_signal, od2_signal, self.fs))
+                    if np.isnan(sci_val):
+                        reasons.append("SCI could not be computed (NaN)")
+                    elif sci_val < self.sci_threshold:
+                        reasons.append(f"SCI {sci_val:.3f} < {self.sci_threshold:.2f}")
 
-                    if sqi_score < self.sqi_threshold:
-                        quality_status = 'POOR'
-                        flagged.append((ch_id, sqi_score, quality_status))
-                        if self.enable_sqi_filtering:
-                            excluded_channels.extend(list(wavelengths.values()))
-                            logger.info(f"    EXCLUDED: {ch_id} (SQI: {sqi_score:.2f} < {self.sqi_threshold})")
-                        else:
-                            logger.info(f"    POOR BUT KEPT: {ch_id} (SQI: {sqi_score:.2f})")
-                    elif sqi_score < 3.0:
-                        quality_status = 'FAIR'
-                        logger.info(f"    FAIR: {ch_id} (SQI: {sqi_score:.2f})")
-                    elif sqi_score < 4.0:
-                        quality_status = 'GOOD'
-                        logger.info(f"    GOOD: {ch_id} (SQI: {sqi_score:.2f})")
-                    else:
-                        quality_status = 'EXCELLENT'
-                        logger.info(f"    EXCELLENT: {ch_id} (SQI: {sqi_score:.2f})")
+                if "psp" in self.enabled_metrics:
+                    psp_val = float(peak_spectral_power(od1_signal, od2_signal, self.fs))
+                    if np.isnan(psp_val):
+                        reasons.append("PSP could not be computed (NaN)")
+                    elif psp_val < self.psp_threshold:
+                        reasons.append(f"PSP {psp_val:.3f} < {self.psp_threshold:.2f}")
 
-                    all_channels.append((ch_id, sqi_score, quality_status))
+            except Exception as e:
+                logger.warning(f" Quality calculation failed for {ch_id_str}: {str(e)}")
+                reasons.append(f"quality calculation error: {e}")
 
-                except Exception as e:
-                    logger.warning(f" SQI calculation failed for {ch_id}: {str(e)}")
-                    flagged.append((ch_id, 1.0, 'FAILED'))
-                    if self.enable_sqi_filtering:
-                        excluded_channels.extend(list(wavelengths.values()))
+            failed = bool(reasons)
+            spared = failed and is_short and not self.exclude_failing_short_channels
+            if spared:
+                reasons = (f"short channel kept despite: " + "; ".join(reasons),)
+                passed = True
             else:
-                logger.warning(f" Channel {ch_id} has {len(wavelengths)} wavelength(s), need 2 for SQI")
-                flagged.append((ch_id, 1.0, 'INSUFFICIENT_WAVELENGTHS'))
-                if self.enable_sqi_filtering:
+                passed = not failed
+                reasons = tuple(reasons)
+
+            cq = ChannelQuality(ch_num, is_short, passed=passed,
+                                sqi=sqi_val, sci=sci_val, psp=psp_val, reasons=reasons)
+            report.channels.append(cq)
+
+            if failed:
+                status = "SPARED (short channel)" if spared else "EXCLUDED" if self.enable_quality_filtering else "KEPT (filtering disabled)"
+                logger.info(f"    FAIL {ch_id_str} [{status}]: {cq.reason_text} "
+                           f"(SQI={sqi_val}, SCI={sci_val}, PSP={psp_val})")
+                if self.enable_quality_filtering and not spared:
                     excluded_channels.extend(list(wavelengths.values()))
-
-        if all_channels:
-            sqi_suffix = "_with_SQI_filtering" if self.enable_sqi_filtering else "_without_SQI_filtering"
-            all_sqi_log = os.path.join(output_dir,
-                                       f"{os.path.splitext(file_basename)[0]}_all_SQI_channels{sqi_suffix}.txt")
-            with open(all_sqi_log, 'w') as f:
-                f.write("Channel\tSQI_Score\tQuality_Status\n")
-                for ch_id, sqi_score, quality_status in all_channels:
-                    f.write(f"{ch_id}\t{sqi_score:.2f}\t{quality_status}\n")
-            logger.info(f"Saved SQI values to: {all_sqi_log}")
-
-        if flagged:
-            poor_sqi_log = os.path.join(output_dir,
-                                        f"{os.path.splitext(file_basename)[0]}_poor_SQI_channels{sqi_suffix}.txt")
-            with open(poor_sqi_log, 'w') as f:
-                f.write("Channel\tSQI_Score\tStatus\tExcluded_from_Analysis\n")
-                for ch_id, sqi_score, status in flagged:
-                    excluded_status = "YES" if self.enable_sqi_filtering else "NO"
-                    f.write(f"{ch_id}\t{sqi_score:.2f}\t{status}\t{excluded_status}\n")
-
-            if self.enable_sqi_filtering:
-                logger.warning(
-                    f"Found {len(flagged)} poor quality channels (SQI < {self.sqi_threshold}) - EXCLUDED from analysis")
             else:
-                logger.warning(
-                    f"Found {len(flagged)} poor quality channels (SQI < {self.sqi_threshold}) - kept in analysis")
-        else:
-            logger.info(f"All {len(all_channels)} channels passed SQI quality threshold (>= {self.sqi_threshold})")
+                logger.debug(f"    PASS {ch_id_str}: SQI={sqi_val}, SCI={sci_val}, PSP={psp_val}")
 
-        logger.info(f"SQI SUMMARY: {len(flagged)} poor channels, {len(excluded_channels)} excluded")
-        return excluded_channels
+        logger.info(f" {report.summary_line()}")
 
-    def _convert_od_to_concentration(self, data: pd.DataFrame, od_cols: List[str], channel_groups: dict) -> Optional[
-        pd.DataFrame]:
-        """Convert OD to concentration using MBLL and Prahl/OMLC extinction coefficients."""
+        # Save a single combined quality report (replaces the old two-txt-file SQI-only output)
+        quality_suffix = "_filtered" if self.enable_quality_filtering else "_unfiltered"
+        report_path = os.path.join(
+            output_dir, f"{os.path.splitext(file_basename)[0]}_quality_report{quality_suffix}.csv"
+        )
         try:
-            logger.info(" Converting OD to concentration using Prahl/OMLC extinction coefficients (cm^-1/M)")
+            report.to_dataframe().to_csv(report_path, index=False)
+            logger.info(f"Saved quality report to: {report_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save quality report: {e}")
 
-            DPF = 6.0
-            DISTANCE_CM = 3.5
-            L_eff_cm = DPF * DISTANCE_CM
+        logger.info(f"QUALITY SUMMARY: {len(report.rejected)} channels excluded of {len(report.channels)} evaluated")
+        return excluded_channels, report
 
-            if L_eff_cm <= 0:
-                logger.error("Effective pathlength is non-positive; check DPF/DISTANCE_CM.")
+    def _apply_tddr(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Apply TDDR (temporal derivative distribution repair) motion correction.
+
+        Only the OD/wavelength signal columns (plus 'Sample number', needed by
+        the tddr implementation) are corrected; all other columns (Event,
+        Time (s), etc.) pass through unchanged. Mirrors
+        FullCapProcessor._apply_tddr so both pipelines apply TDDR the same way,
+        in the same position in the pipeline (after quality metrics, before
+        OD-to-concentration conversion).
+        """
+        try:
+            signals = data.filter(regex="WL|Sample")
+            corrected = tddr(signals, sample_rate=self.fs)
+            out = data.copy()
+            for col in corrected.columns:
+                out[col] = corrected[col]
+            return out
+        except Exception as e:
+            logger.warning(f"TDDR failed: {str(e)}; continuing with uncorrected OD data")
+            return data
+
+
+    def _baseline_window_samples(self, events, task_type, n_samples):
+        """Locate the pre-task baseline window (start, end) sample indices used to
+        reference OD -> Delta-OD, mirroring _apply_baseline_correction's choice so
+        the OD reference and the later concentration baseline agree.
+
+        Priority:
+            LShape            : 2nd -> 3rd event markers
+            S1 present + W1    : [S1, W1]   (standard pre-walk standing baseline)
+            S1 present + S2    : [S1, S2]
+            S1 present only    : [S1, S1 + baseline_duration]
+            no usable events   : [0, baseline_duration]   (first baseline_duration s)
+
+        Returns (start, end) clamped to [0, n_samples) and required to span at
+        least ~1 s, or None if nothing usable (caller then falls back to the
+        whole-record per-channel mean).
+        """
+        min_span = max(1, int(1.0 * self.fs))
+
+        def _clamp(a, b):
+            a = int(max(0, min(a, n_samples - 1)))
+            b = int(max(0, min(b, n_samples)))
+            if b - a < min_span:
                 return None
+            return (a, b)
+
+        # Task-timing durations for the event-poor fallbacks.
+        file_basename = getattr(self, "_current_file_basename", "")
+        timing = self._get_task_timing(file_basename, task_type or "Unknown")
+        base_samples = int(timing.get("baseline_duration", 20.0) * self.fs)
+
+        if events is not None and not events.empty and "Event" in events.columns:
+            ev = events.copy()
+            ev["Sample number"] = pd.to_numeric(ev["Sample number"], errors="coerce")
+            ev = ev.dropna(subset=["Sample number"])
+            ev["_E"] = ev["Event"].astype(str).str.strip().str.upper()
+            ev = ev.sort_values("Sample number").reset_index(drop=True)
+
+            # LShape uses the 2nd -> 3rd markers (matches _apply_lshape_baseline).
+            if task_type == "LShape" and len(ev) >= 3:
+                w = _clamp(ev.iloc[1]["Sample number"], ev.iloc[2]["Sample number"])
+                if w:
+                    logger.info(f" OD baseline reference: LShape 2nd->3rd events {w}")
+                    return w
+
+            s1 = ev[ev["_E"] == "S1"]
+            if not s1.empty:
+                s1_s = s1.iloc[0]["Sample number"]
+
+                # Preferred: S1 -> W1 (the requested pre-walk standing baseline).
+                w1 = ev[(ev["_E"] == "W1") & (ev["Sample number"] > s1_s)]
+                if not w1.empty:
+                    w = _clamp(s1_s, w1.iloc[0]["Sample number"])
+                    if w:
+                        logger.info(f" OD baseline reference: S1->W1 window {w}")
+                        return w
+
+                # Secondary: S1 -> S2.
+                s2 = ev[(ev["_E"] == "S2") & (ev["Sample number"] > s1_s)]
+                if not s2.empty:
+                    w = _clamp(s1_s, s2.iloc[0]["Sample number"])
+                    if w:
+                        logger.info(f" OD baseline reference: S1->S2 window {w}")
+                        return w
+
+                # S1 only: take baseline_duration seconds after S1.
+                w = _clamp(s1_s, s1_s + base_samples)
+                if w:
+                    logger.info(f" OD baseline reference: S1 + {base_samples} samples {w}")
+                    return w
+
+        # No usable events: reference to the first baseline_duration seconds.
+        w = _clamp(0, base_samples)
+        if w:
+            logger.warning(f" OD baseline reference: no S1/W1 markers; using first "
+                           f"{base_samples} samples {w}")
+        else:
+            logger.warning(" OD baseline reference: could not build a baseline window; "
+                           "falling back to whole-record mean.")
+        return w
+
+
+    def _baseline_window_samples(self, events, task_type, n_samples):
+        """Locate the pre-task baseline window (start, end) sample indices used to
+        reference OD -> Delta-OD, mirroring _apply_baseline_correction's choice so
+        the OD reference and the later concentration baseline agree.
+
+        Priority:
+            LShape            : 2nd -> 3rd event markers
+            S1 present + W1    : [S1, W1]   (standard pre-walk standing baseline)
+            S1 present + S2    : [S1, S2]
+            S1 present only    : [S1, S1 + baseline_duration]
+            no usable events   : [0, baseline_duration]   (first baseline_duration s)
+
+        Returns (start, end) clamped to [0, n_samples) and required to span at
+        least ~1 s, or None if nothing usable (caller then falls back to the
+        whole-record per-channel mean).
+        """
+        min_span = max(1, int(1.0 * self.fs))
+
+        def _clamp(a, b):
+            a = int(max(0, min(a, n_samples - 1)))
+            b = int(max(0, min(b, n_samples)))
+            if b - a < min_span:
+                return None
+            return (a, b)
+
+        # Task-timing durations for the event-poor fallbacks.
+        file_basename = getattr(self, "_current_file_basename", "")
+        timing = self._get_task_timing(file_basename, task_type or "Unknown")
+        base_samples = int(timing.get("baseline_duration", 20.0) * self.fs)
+
+        if events is not None and not events.empty and "Event" in events.columns:
+            ev = events.copy()
+            ev["Sample number"] = pd.to_numeric(ev["Sample number"], errors="coerce")
+            ev = ev.dropna(subset=["Sample number"])
+            ev["_E"] = ev["Event"].astype(str).str.strip().str.upper()
+            ev = ev.sort_values("Sample number").reset_index(drop=True)
+
+            # LShape uses the 2nd -> 3rd markers (matches _apply_lshape_baseline).
+            if task_type == "LShape" and len(ev) >= 3:
+                w = _clamp(ev.iloc[1]["Sample number"], ev.iloc[2]["Sample number"])
+                if w:
+                    logger.info(f" OD baseline reference: LShape 2nd->3rd events {w}")
+                    return w
+
+            s1 = ev[ev["_E"] == "S1"]
+            if not s1.empty:
+                s1_s = s1.iloc[0]["Sample number"]
+
+                # Preferred: S1 -> W1 (the requested pre-walk standing baseline).
+                w1 = ev[(ev["_E"] == "W1") & (ev["Sample number"] > s1_s)]
+                if not w1.empty:
+                    w = _clamp(s1_s, w1.iloc[0]["Sample number"])
+                    if w:
+                        logger.info(f" OD baseline reference: S1->W1 window {w}")
+                        return w
+
+                # Secondary: S1 -> S2.
+                s2 = ev[(ev["_E"] == "S2") & (ev["Sample number"] > s1_s)]
+                if not s2.empty:
+                    w = _clamp(s1_s, s2.iloc[0]["Sample number"])
+                    if w:
+                        logger.info(f" OD baseline reference: S1->S2 window {w}")
+                        return w
+
+                # S1 only: take baseline_duration seconds after S1.
+                w = _clamp(s1_s, s1_s + base_samples)
+                if w:
+                    logger.info(f" OD baseline reference: S1 + {base_samples} samples {w}")
+                    return w
+
+        # No usable events: reference to the first baseline_duration seconds.
+        w = _clamp(0, base_samples)
+        if w:
+            logger.warning(f" OD baseline reference: no S1/W1 markers; using first "
+                           f"{base_samples} samples {w}")
+        else:
+            logger.warning(" OD baseline reference: could not build a baseline window; "
+                           "falling back to whole-record mean.")
+        return w
+
+    def _convert_od_to_concentration(self, data, od_cols, channel_groups,
+                                     events=None, task_type=None):
+        """Convert OD to Delta-concentration using MBLL and Prahl/OMLC extinction
+        coefficients (cm^-1/M), with per-channel pathlength and OD referenced to the
+        S1->W1 pre-walk baseline window.
+
+        Each channel's OD is referenced to its mean over the baseline window
+        (Delta-OD = OD - mean_baseline(OD)) before the MBLL solve, so the output is
+        Delta[Hb] anchored to the resting/standing period. If no baseline window can
+        be located (events/task_type not supplied, or markers missing), the method
+        falls back to referencing against the whole-record per-channel mean.
+
+        The extinction table is restricted to the fine 2 nm range around this
+        device's light-source wavelengths (756-759 nm and 846-848 nm); odd-nm
+        entries are linearly interpolated from tabulated even-nm neighbours and
+        847 nm is interpolated from the 846/848 anchors by np.interp.
+        """
+        try:
+            DPF = 6.0  # confirmed fixed for this device/protocol
+            DISTANCE_LONG_CM = 3.5  # long channels: 35 mm source-detector separation
+            DISTANCE_SHORT_CM = 1.5  # short channels (CH3/CH5): 15 mm separation
+
+            # Locate the pre-walk baseline window ONCE (same for every channel).
+            n_samples = len(data)
+            window = self._baseline_window_samples(events, task_type, n_samples)
+            if window is not None:
+                b_start, b_end = window
+                logger.info(f" Converting OD to Delta[Hb] referenced to baseline samples "
+                            f"{b_start}-{b_end} (~{(b_end - b_start) / self.fs:.1f}s), "
+                            f"per-channel pathlength")
+            else:
+                b_start = b_end = None
+                logger.info(" Converting OD to Delta[Hb] referenced to whole-record mean "
+                            "(no baseline window), per-channel pathlength")
 
             PRAHL_CM1_PER_M = {
-                650: (368.0, 3750.12), 660: (319.6, 3226.56), 670: (294.0, 2795.12),
-                680: (277.6, 2407.92), 690: (276.0, 2051.96), 700: (290.0, 1794.28),
-                710: (314.0, 1540.48), 720: (348.0, 1325.88), 730: (390.0, 1102.2),
-                740: (446.0, 1115.88), 750: (518.0, 1405.24), 760: (586.0, 1548.52),
-                770: (650.0, 1311.88), 780: (710.0, 1075.44), 790: (756.0, 890.8),
-                800: (816.0, 761.72), 810: (864.0, 717.08), 820: (916.0, 693.76),
-                830: (974.0, 693.04), 840: (1022.0, 692.36), 850: (1058.0, 691.32),
-                860: (1092.0, 694.32), 870: (1128.0, 705.84), 880: (1154.0, 726.44),
-                890: (1178.0, 743.6), 900: (1198.0, 761.84), 910: (1214.0, 774.56),
-                920: (1224.0, 777.36), 930: (1222.0, 763.84), 940: (1214.0, 693.44),
-                950: (1204.0, 602.24), 960: (1186.0, 525.56), 970: (1162.0, 429.32),
-                980: (1128.0, 359.656), 990: (1080.0, 283.22), 1000: (1024.0, 206.784),
-                # Extended wavelength coverage
-                757: (574.0, 1560.48), 846: (1050.0, 691.76),
+                750: (518.0, 1405.24),
+                752: (533.2, 1515.32),
+                754: (548.4, 1541.76),
+                756: (562.0, 1560.48),
+                757: (568.0, 1560.48),  # interpolated between 756 and 758
+                758: (574.0, 1560.48),
+                759: (580.0, 1554.50),  # interpolated between 758 and 760
+                760: (586.0, 1548.52),
+                762: (598.0, 1508.44),
+                764: (610.0, 1459.56),
+                836: (1001.2, 692.64),
+                838: (1011.6, 692.48),
+                839: (1016.8, 692.42),  # interpolated between 838 and 840
+                840: (1022.0, 692.36),
+                842: (1032.4, 692.20),
+                844: (1042.8, 691.96),
+                846: (1050.0, 691.76),
+                848: (1054.0, 691.52),
+                850: (1058.0, 691.32),
+                852: (1062.0, 691.08),
             }
 
             wl_grid = np.array(sorted(PRAHL_CM1_PER_M.keys()), dtype=float)
             hbO2_grid = np.array([PRAHL_CM1_PER_M[int(w)][0] for w in wl_grid], dtype=float)
             hb_grid = np.array([PRAHL_CM1_PER_M[int(w)][1] for w in wl_grid], dtype=float)
 
-            def _eps_at_nm(w: float) -> Tuple[float, float]:
+            def _eps_at_nm(w):
                 if w < wl_grid.min() or w > wl_grid.max():
                     raise ValueError(
                         f"Wavelength {w} nm outside Prahl table range ({wl_grid.min()}-{wl_grid.max()} nm).")
                 eps_hbo2 = float(np.interp(w, wl_grid, hbO2_grid))
                 eps_hb = float(np.interp(w, wl_grid, hb_grid))
                 return eps_hbo2, eps_hb
+
+            def _baseline_ref(sig):
+                """Mean of `sig` over the baseline window, or whole-record mean if
+                no window / the window is all-NaN."""
+                if b_start is not None:
+                    ref = np.nanmean(sig[b_start:b_end])
+                    if np.isfinite(ref):
+                        return ref
+                return np.nanmean(sig)
 
             concentration_data = pd.DataFrame(index=data.index)
             converted_channels = 0
@@ -1203,10 +1524,19 @@ class FileProcessor:
                 if len(wavelengths) != 2:
                     continue
 
+                # Per-channel pathlength: short vs long.
+                ch_match = re.match(r'CH(\d+)', str(ch_id))
+                ch_num = int(ch_match.group(1)) if ch_match else -1
+                is_short = ch_num in SHORT_CHANNEL_IDS
+                distance_cm = DISTANCE_SHORT_CM if is_short else DISTANCE_LONG_CM
+                L_eff_cm = DPF * distance_cm
+                if L_eff_cm <= 0:
+                    logger.error(f"Effective pathlength non-positive for {ch_id}; skipping.")
+                    continue
+
                 wl_keys = list(wavelengths.keys())
                 wl1 = float(wl_keys[0])
                 wl2 = float(wl_keys[1])
-
                 od1_col = wavelengths[wl_keys[0]]
                 od2_col = wavelengths[wl_keys[1]]
 
@@ -1216,6 +1546,10 @@ class FileProcessor:
 
                 od1 = data[od1_col].to_numpy(dtype=np.float64)
                 od2 = data[od2_col].to_numpy(dtype=np.float64)
+
+                # Reference to the pre-walk baseline window: absolute OD -> Delta-OD.
+                od1 = od1 - _baseline_ref(od1)
+                od2 = od2 - _baseline_ref(od2)
 
                 eps1_hbo, eps1_hbr = _eps_at_nm(wl1)
                 eps2_hbo, eps2_hbr = _eps_at_nm(wl2)
@@ -1236,9 +1570,12 @@ class FileProcessor:
                 converted_channels += 1
 
                 logger.debug(
-                    f"{ch_id} ({wl1:.0f}/{wl2:.0f} nm) means HbO={np.nanmean(hbO_uM):.3f} µM, HbR={np.nanmean(hbR_uM):.3f} µM")
+                    f"{ch_id} ({'short' if is_short else 'long'}, L={L_eff_cm:.1f}cm, "
+                    f"{wl1:.0f}/{wl2:.0f} nm) baseline-referenced Delta means "
+                    f"HbO={np.nanmean(hbO_uM):.3f} uM, HbR={np.nanmean(hbR_uM):.3f} uM")
 
-            logger.info(f" Converted {converted_channels} channels OD to µM using Prahl coefficients")
+            logger.info(f" Converted {converted_channels} channels OD -> Delta[Hb] (uM), "
+                        f"pre-walk baseline-referenced")
             return concentration_data if not concentration_data.empty else None
 
         except Exception as e:
@@ -1387,8 +1724,35 @@ class FileProcessor:
             data.insert(0, "Sample number", np.arange(len(data)))
         return data
 
+    def _drop_initial_seconds(self, data: pd.DataFrame, seconds: float) -> pd.DataFrame:
+        """Drop the first `seconds` of a recording (device/initialization
+        artifacts), matching FullCapProcessor's initial crop. Renumbers
+        'Sample number' and 'Time (s)' (if present) afterward so downstream
+        code sees a clean, zero-based timeline. No-op if seconds <= 0.
+        """
+        if seconds is None or seconds <= 0:
+            return data
+
+        n = int(seconds * self.fs)
+        if n <= 0:
+            return data
+        if len(data) <= n:
+            logger.warning(f"Recording has only {len(data)} samples (<= {n} to drop for a "
+                           f"{seconds}s crop at {self.fs}Hz); skipping initial-seconds crop.")
+            return data
+
+        cropped = data.iloc[n:].reset_index(drop=True)
+        if 'Sample number' in cropped.columns:
+            cropped['Sample number'] = np.arange(len(cropped))
+        if 'Time (s)' in cropped.columns:
+            cropped['Time (s)'] = cropped['Sample number'] / self.fs
+
+        logger.info(f"Dropped initial {seconds}s ({n} samples) from recording "
+                    f"({len(data)} -> {len(cropped)} rows)")
+        return cropped
+
     def _apply_scr(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Apply Short Channel Regression."""
+        """Apply Short Channel Regression (long channels regressed against short channels)."""
         logger.warning("SCR CHECKPOINT: _apply_scr() was called")
 
         try:
@@ -1397,7 +1761,7 @@ class FileProcessor:
                 return data
 
             prefixes = {str(c).split()[0] for c in sig_cols if str(c).startswith("CH")}
-            short_ids = {"CH2", "CH6"}
+            short_ids = {f"CH{i}" for i in SHORT_CHANNEL_IDS}  # CH3, CH5 (0-based) == optodes 4, 6 (1-based)
 
             short_prefixes = prefixes & short_ids
             long_prefixes = prefixes - short_prefixes
@@ -1407,7 +1771,7 @@ class FileProcessor:
 
             if not short_cols or not long_cols:
                 if not short_cols:
-                    logger.warning("SCR skipped: no short-channel columns (CH2/CH6) present.")
+                    logger.warning(f"SCR skipped: no short-channel columns ({sorted(short_ids)}) present.")
                 else:
                     logger.warning("SCR skipped: no long-channel columns present.")
                 return data
@@ -1418,19 +1782,11 @@ class FileProcessor:
             for col in scr_long.columns:
                 out[col] = scr_long[col]
 
-            logger.info(f"SCR applied: {len(long_cols)} long cols, {len(short_cols)} short cols (CH2/CH6)")
+            logger.info(f"SCR applied: {len(long_cols)} long cols, {len(short_cols)} short cols ({sorted(short_ids)})")
             return out
 
         except Exception as e:
             logger.warning(f"SCR failed: {str(e)}")
-            return data
-
-    def _apply_tddr(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Apply TDDR correction."""
-        try:
-            return tddr(data, sample_rate=self.fs)
-        except Exception as e:
-            logger.warning(f"TDDR failed: {str(e)}")
             return data
 
     def _apply_baseline_correction(self, data: pd.DataFrame, events: pd.DataFrame,
@@ -1589,7 +1945,18 @@ class FileProcessor:
             # NOTE: Trimming already happened in _process_pipeline_stages - do NOT apply again
 
             logger.info("Creating non-Z-transformed averaged data")
-            averaged_raw = average_channels(data.copy())
+            # Pass the montage explicitly rather than letting average_channels()
+            # guess zero- vs one-based numbering from whether CH0 happens to be
+            # present. If SQI filtering ever drops CH0 specifically, that guess
+            # would silently flip to the wrong montage table (see
+            # SHORT_CHANNEL_IDS comment at top of this module for the source of
+            # truth); passing short/left/right explicitly avoids that entirely.
+            averaged_raw = average_channels(
+                data.copy(),
+                short_ids=sorted(SHORT_CHANNEL_IDS),
+                left_ids=[4, 6, 7],
+                right_ids=[0, 1, 2],
+            )
 
             for col in ['grand oxy', 'grand deoxy']:
                 if col not in averaged_raw.columns:
@@ -1611,7 +1978,12 @@ class FileProcessor:
                 z_transformed_data = data.copy()
 
             logger.info("Averaging Z-transformed channels")
-            averaged_z = average_channels(z_transformed_data)
+            averaged_z = average_channels(
+                z_transformed_data,
+                short_ids=sorted(SHORT_CHANNEL_IDS),
+                left_ids=[4, 6, 7],
+                right_ids=[0, 1, 2],
+            )
 
             for col in ['grand oxy', 'grand deoxy']:
                 if col not in averaged_z.columns:
@@ -1632,18 +2004,20 @@ class FileProcessor:
                 df_version['Subject'] = subject
                 df_version['TaskType'] = source_filename
                 df_version['TaskCategory'] = task_category
-                df_version['SQI_Filtering_Applied'] = bool(self.enable_sqi_filtering)
-            sqi_suffix = "_with_SQI_filtering" if self.enable_sqi_filtering else "_without_SQI_filtering"
-            condition_dir = os.path.join(output_dir, f"{task_type}{sqi_suffix}")
+                df_version['Quality_Filtering_Applied'] = bool(self.enable_quality_filtering)
+                df_version['Quality_Metrics_Used'] = '+'.join(self.enabled_metrics) or 'none'
+            metrics_tag = '_'.join(m.upper() for m in self.enabled_metrics) or 'NONE'
+            quality_suffix = f"_with_{metrics_tag}_filtering" if self.enable_quality_filtering else "_without_quality_filtering"
+            condition_dir = os.path.join(output_dir, f"{task_type}{quality_suffix}")
             os.makedirs(condition_dir, exist_ok=True)
 
-            output_file_raw = os.path.join(condition_dir, f"{file_basename}_FULLY_PROCESSED_RAW{sqi_suffix}.csv")
+            output_file_raw = os.path.join(condition_dir, f"{file_basename}_FULLY_PROCESSED_RAW{quality_suffix}.csv")
             averaged_raw.to_csv(output_file_raw, index=False)
             logger.info(f" Saved RAW (non-Z-scored) data to {output_file_raw}")
             logger.info(f"   Grand oxy mean: {averaged_raw['grand oxy'].mean():.6f}")
             logger.info(f"   Grand deoxy mean: {averaged_raw['grand deoxy'].mean():.6f}")
 
-            output_file_z = os.path.join(condition_dir, f"{file_basename}_FULLY_PROCESSED_ZSCORE{sqi_suffix}.csv")
+            output_file_z = os.path.join(condition_dir, f"{file_basename}_FULLY_PROCESSED_ZSCORE{quality_suffix}.csv")
             averaged_z.to_csv(output_file_z, index=False)
             logger.info(f" Saved Z-SCORED data to {output_file_z}")
 
@@ -1651,17 +2025,17 @@ class FileProcessor:
                 plot_condition = task_type
 
                 self._create_final_plot(
-                    averaged_raw, condition_dir, file_basename, f"{plot_condition}{sqi_suffix}",
+                    averaged_raw, condition_dir, file_basename, f"{plot_condition}{quality_suffix}",
                     ['grand oxy', 'grand deoxy'],
-                    f'final_overall_RAW{sqi_suffix}',
-                    f'Final Overall - Raw Concentrations{sqi_suffix}', events
+                    f'final_overall_RAW{quality_suffix}',
+                    f'Final Overall - Raw Concentrations{quality_suffix}', events
                 )
 
                 self._create_final_plot(
-                    averaged_z, condition_dir, file_basename, f"{plot_condition}{sqi_suffix}",
+                    averaged_z, condition_dir, file_basename, f"{plot_condition}{quality_suffix}",
                     ['grand oxy', 'grand deoxy'],
-                    f'final_overall_ZSCORE{sqi_suffix}',
-                    f'Final Overall - Z-scores{sqi_suffix}', events
+                    f'final_overall_ZSCORE{quality_suffix}',
+                    f'Final Overall - Z-scores{quality_suffix}', events
                 )
             except Exception as e:
                 logger.warning(f" Plotting failed for {file_basename}: {e}")
