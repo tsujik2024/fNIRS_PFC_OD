@@ -1,23 +1,31 @@
-"""Automatic channel rejection by scalp-coupling quality (SCI + PSP).
+"""Channel-quality data structures and (standalone) SCI/PSP scoring.
 
-This runs *before* the rest of preprocessing. Each channel's two-wavelength
-optical-density traces are scored with the Scalp Coupling Index (SCI, Pollonini
-2014) and Peak Spectral Power (PSP, PHOEBE / Pollonini 2016). A channel is
-rejected if it fails *either* threshold:
+As of the consolidation described below, channel quality control (SQI, SCI,
+PSP - any combination) is computed directly inside
+:class:`~fnirs_PFC_2025.processing.file_processor.FileProcessor`, using the
+:class:`ChannelQuality` / :class:`QualityReport` dataclasses defined here as
+the shared report structure. :class:`BatchProcessor` and
+:class:`PipelineManager` consume the ``QualityReport`` FileProcessor returns;
+neither runs its own separate quality prefilter anymore.
 
+:class:`ChannelQualityControl` (SCI/PSP-only, unconditional) is kept in this
+module for standalone/manual use, but is no longer wired into the default
+pipeline - FileProcessor's own quality logic supersedes it there.
+
+A channel is rejected if it fails *any* of its enabled metrics:
+
+* ``SQI < sqi_threshold``  (default 2.0, disabled by default)
 * ``SCI < sci_threshold``  (default 0.75)
 * ``PSP < psp_threshold``  (default 0.10)
 
 Short channels are retained by default even when they fail, because they are
 used as regressors rather than as signal (set ``exclude_failing_short_channels``
-to change this). The result is a :class:`QualityReport` summarising every
-channel's score and verdict, plus the list of OD columns to keep downstream.
+to change this).
 
-Channel columns are expected to be named ``CH{n}_WL{wavelength}`` (e.g.
-``CH0_WL757``, ``CH0_WL846``), matching the project's loader output. Channel
-indices are **zero-based** (``CH0``..``CH7``), so ``short_channels`` must use the
-same convention: the OctaMon short channels labelled 4 and 6 in 1-based optode
-numbering are ``CH3`` and ``CH5`` here, which is the default.
+Channel columns are expected to be named ``CH{n}_WL{wavelength}`` (OD) or
+``CH{n} HbO``/``CH{n} HbR`` (concentration). Channel indices are **zero-based**
+(``CH0``..``CH7``): the OctaMon short channels labelled 4 and 6 in 1-based
+optode numbering are ``CH3`` and ``CH5`` here.
 """
 
 from __future__ import annotations
@@ -35,9 +43,11 @@ from fnirs_PFC_2025.preprocessing.sci import scalp_coupling_index
 
 logger = logging.getLogger(__name__)
 
-# Literature defaults (Pollonini / PHOEBE).
+# Literature defaults (Pollonini / PHOEBE) for SCI/PSP; SQI threshold is on a
+# 1-5 scale from FileProcessor's own SQI implementation.
 DEFAULT_SCI_THRESHOLD = 0.75
 DEFAULT_PSP_THRESHOLD = 0.10
+DEFAULT_SQI_THRESHOLD = 2.0
 DEFAULT_CARDIAC_BAND = (0.5, 2.5)
 DEFAULT_FILTER_ORDER = 4
 
@@ -46,13 +56,18 @@ _CHANNEL_RE = re.compile(r"CH(\d+)_WL(\d+)", re.IGNORECASE)
 
 @dataclass(frozen=True)
 class ChannelQuality:
-    """SCI/PSP scores and verdict for a single channel."""
+    """Per-channel quality scores and verdict.
+
+    Any of ``sqi``/``sci``/``psp`` may be ``None`` if that metric wasn't
+    computed for this channel (i.e. it wasn't in the caller's enabled set).
+    """
 
     channel: int
     is_short: bool
-    sci: float
-    psp: float
     passed: bool
+    sqi: Optional[float] = None
+    sci: Optional[float] = None
+    psp: Optional[float] = None
     reasons: Tuple[str, ...] = ()
 
     @property
@@ -66,6 +81,8 @@ class QualityReport:
     """Outcome of channel quality control for one recording."""
 
     channels: List[ChannelQuality] = field(default_factory=list)
+    metrics_used: Tuple[str, ...] = ()
+    sqi_threshold: float = DEFAULT_SQI_THRESHOLD
     sci_threshold: float = DEFAULT_SCI_THRESHOLD
     psp_threshold: float = DEFAULT_PSP_THRESHOLD
 
@@ -91,8 +108,9 @@ class QualityReport:
 
     def summary_line(self) -> str:
         """One-line summary, e.g. '5 of 6 channels retained (long: 3/4)'."""
+        metrics = "+".join(m.upper() for m in self.metrics_used) or "none"
         return (f"{len(self.retained)} of {len(self.channels)} channels retained "
-                f"(long: {self.n_long_retained}/{self.n_long_total})")
+                f"(long: {self.n_long_retained}/{self.n_long_total}) using {metrics}")
 
     def to_dataframe(self) -> pd.DataFrame:
         """Tabulate per-channel scores and verdicts."""
@@ -100,6 +118,7 @@ class QualityReport:
             {
                 "Channel": c.channel,
                 "Short": c.is_short,
+                "SQI": c.sqi,
                 "SCI": c.sci,
                 "PSP": c.psp,
                 "Passed": c.passed,
@@ -110,7 +129,14 @@ class QualityReport:
 
 
 class ChannelQualityControl:
-    """Score channels with SCI/PSP and decide which to keep."""
+    """Score channels with SCI/PSP and decide which to keep.
+
+    Standalone SCI/PSP-only QC helper. NOT used by the default
+    FileProcessor/BatchProcessor/PipelineManager pipeline as of the
+    consolidation described in the module docstring - FileProcessor computes
+    quality (any combination of SQI/SCI/PSP) itself. Kept here for manual or
+    exploratory use.
+    """
 
     def __init__(
         self,
@@ -138,10 +164,12 @@ class ChannelQualityControl:
         channels = self._channel_wavelengths(data)
         if not channels:
             logger.warning("No 'CH{n}_WL{wl}' columns found for quality control.")
-            return QualityReport(sci_threshold=self.sci_threshold,
+            return QualityReport(metrics_used=("sci", "psp"),
+                                 sci_threshold=self.sci_threshold,
                                  psp_threshold=self.psp_threshold)
 
-        report = QualityReport(sci_threshold=self.sci_threshold,
+        report = QualityReport(metrics_used=("sci", "psp"),
+                               sci_threshold=self.sci_threshold,
                                psp_threshold=self.psp_threshold)
         for channel in sorted(channels):
             col1, col2 = channels[channel]
@@ -193,11 +221,11 @@ class ChannelQualityControl:
         failed = bool(reasons)
         if failed and is_short and not self.exclude_failing_short_channels:
             # Short channel kept despite failing; record why it was spared.
-            return ChannelQuality(channel, True, sci, psp, passed=True,
+            return ChannelQuality(channel, True, passed=True, sci=sci, psp=psp,
                                   reasons=("short channel kept despite: "
                                            + "; ".join(reasons),))
-        return ChannelQuality(channel, is_short, sci, psp,
-                              passed=not failed, reasons=tuple(reasons))
+        return ChannelQuality(channel, is_short, passed=not failed, sci=sci, psp=psp,
+                              reasons=tuple(reasons))
 
     def _channel_wavelengths(self, data: pd.DataFrame) -> Dict[int, Tuple[str, str]]:
         """Map ``channel -> (wl1_col, wl2_col)`` from ``CH{n}_WL{wl}`` columns."""
