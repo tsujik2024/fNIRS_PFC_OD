@@ -1,17 +1,3 @@
-"""Figure builders for fNIRS hemoglobin signals.
-
-Each function builds and returns a Matplotlib :class:`~matplotlib.figure.Figure`
-without showing or saving it, keeping plotting free of I/O and global state.
-Hemoglobin species are matched by column-name keywords so the same helpers work
-for raw concentration frames and grand-average frames:
-
-* oxy   : ``HbO``, ``O2Hb``, ``grand oxy``
-* deoxy : ``HbR``, ``HHb``, ``grand deoxy``
-
-Configure a headless backend (``matplotlib.use("Agg")``) before importing pyplot
-when running without a display.
-"""
-
 from __future__ import annotations
 
 import logging
