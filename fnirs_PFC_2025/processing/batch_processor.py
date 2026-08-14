@@ -1,16 +1,14 @@
-"""Batch execution: discover recordings, quality-control channels, run the pipeline.
+"""Batch execution: discover recordings, run the pipeline.
 
 :class:`BatchProcessor` is the execution engine of the orchestration layer. For
-each recording it:
-
-1. loads the optical-density data via ``read_txt_file``;
-2. runs SCI/PSP channel quality control (``ChannelQualityControl``), dropping
-   channels that fail ``SCI < 0.75`` or ``PSP < 0.10`` (defaults, overridable);
-3. hands the retained channels to
-   :class:`~fnirs_PFC_2025.processing.file_processor.FileProcessor`.
+each recording it hands the file straight to
+:class:`~fnirs_PFC_2025.processing.file_processor.FileProcessor`, which now
+performs channel-quality scoring (any combination of SQI/SCI/PSP) and
+filtering internally - there is no separate prefilter here anymore.
 
 It groups recordings by task type, tracks per-task outcomes, and collects the
-per-recording QC reports. It does not compute statistics or plots - that is
+per-recording quality reports (surfaced by FileProcessor's ``process_file``
+return value). It does not compute statistics or plots - that is
 :class:`PipelineManager`'s job.
 """
 
@@ -21,13 +19,13 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from fnirs_PFC_2025.processing.file_processor import FileProcessor
 from fnirs_PFC_2025.processing.quality_control import (
     DEFAULT_PSP_THRESHOLD,
     DEFAULT_SCI_THRESHOLD,
-    ChannelQualityControl,
+    DEFAULT_SQI_THRESHOLD,
     QualityReport,
 )
 from fnirs_PFC_2025.read.loaders import read_txt_file
@@ -50,7 +48,7 @@ class BatchResult:
     total_files: int = 0
     # task_type -> outcome -> list of input file paths
     by_task: Dict[str, Dict[str, List[str]]] = field(default_factory=dict)
-    # input file path -> QC report for that recording
+    # input file path -> QualityReport for that recording (from FileProcessor)
     qc_reports: Dict[str, QualityReport] = field(default_factory=dict)
 
     @property
@@ -64,41 +62,66 @@ class BatchProcessor:
     def __init__(
         self,
         fs: float = 50.0,
+        sqi_threshold: float = DEFAULT_SQI_THRESHOLD,
         sci_threshold: float = DEFAULT_SCI_THRESHOLD,
         psp_threshold: float = DEFAULT_PSP_THRESHOLD,
-        post_walking_trim_seconds: float = 3.0,
-        sqi_threshold: float = 2.0,
-        enable_sqi_filtering: bool = False,
-        short_channels: Sequence[int] = (3, 5),  # CH3, CH5 (0-based) = short channels 4 & 6
+        enabled_metrics: Tuple[str, ...] = ("sci", "psp"),
+        enable_quality_filtering: bool = True,
         exclude_failing_short_channels: bool = False,
+        post_walking_trim_seconds: float = 3.0,
+        initial_crop_seconds: float = 1.0,
         file_extension: str = ".txt",
         read_file_func: Callable = read_txt_file,
     ) -> None:
+        """
+        Args:
+            fs: Sampling frequency in Hz
+            sqi_threshold, sci_threshold, psp_threshold: per-metric thresholds,
+                passed straight through to FileProcessor.
+            enabled_metrics: which of "sqi", "sci", "psp" gate channel exclusion.
+                Default ("sci", "psp") - SQI is opt-in. Passed straight through
+                to FileProcessor, which is now the single place quality control
+                happens for this pipeline.
+            enable_quality_filtering: if True (default), channels failing an
+                enabled metric are dropped; if False, quality is still computed
+                and reported but nothing is removed.
+            exclude_failing_short_channels: if True, short channels (CH3/CH5)
+                that fail are also dropped, instead of being spared by default.
+            post_walking_trim_seconds: seconds to trim after walking start event.
+            initial_crop_seconds: seconds to drop from the start of every
+                recording (device/initialization artifacts). Default 1.0s,
+                matching FullCapProcessor's initial crop.
+            file_extension: extension to search for when discovering recordings.
+            read_file_func: loader callable, ``read_txt_file``-compatible.
+        """
         self.fs = fs
+        self.sqi_threshold = sqi_threshold
         self.sci_threshold = sci_threshold
         self.psp_threshold = psp_threshold
+        self.enabled_metrics = tuple(m.lower() for m in enabled_metrics)
+        self.enable_quality_filtering = enable_quality_filtering
+        self.exclude_failing_short_channels = exclude_failing_short_channels
         self.post_walking_trim_seconds = post_walking_trim_seconds
-        self.enable_sqi_filtering = enable_sqi_filtering
+        self.initial_crop_seconds = initial_crop_seconds
         self._extension = file_extension.lower()
         self._read_file_func = read_file_func
-        self._qc = ChannelQualityControl(
-            fs=fs,
-            sci_threshold=sci_threshold,
-            psp_threshold=psp_threshold,
-            short_channels=short_channels,
-            exclude_failing_short_channels=exclude_failing_short_channels,
-        )
         self._processor = FileProcessor(
             fs=fs,
             sqi_threshold=sqi_threshold,
-            enable_sqi_filtering=enable_sqi_filtering,
+            sci_threshold=sci_threshold,
+            psp_threshold=psp_threshold,
+            enabled_metrics=self.enabled_metrics,
+            enable_quality_filtering=enable_quality_filtering,
+            exclude_failing_short_channels=exclude_failing_short_channels,
             post_walking_trim_seconds=post_walking_trim_seconds,
+            initial_crop_seconds=initial_crop_seconds,
         )
         logger.info(
-            "BatchProcessor ready (fs=%.1f Hz, SCI<%.2f / PSP<%.2f rejection, "
-            "SQI filtering=%s, post-walk trim=%.1fs).",
-            fs, sci_threshold, psp_threshold, enable_sqi_filtering,
-            post_walking_trim_seconds,
+            "BatchProcessor ready (fs=%.1f Hz, metrics=%s, thresholds: SQI>=%.2f "
+            "SCI>=%.2f PSP>=%.2f, quality filtering=%s, initial crop=%.1fs, "
+            "post-walk trim=%.1fs).",
+            fs, self.enabled_metrics, sqi_threshold, sci_threshold, psp_threshold,
+            enable_quality_filtering, initial_crop_seconds, post_walking_trim_seconds,
         )
 
     # ----- discovery ------------------------------------------------------ #
@@ -164,15 +187,15 @@ class BatchProcessor:
         subject_y_limits: Optional[Dict[str, Dict[str, float]]],
         batch: BatchResult,
     ) -> str:
-        """Quality-control then process a single recording; return its outcome."""
+        """Process a single recording (FileProcessor does its own quality control
+        internally); return its outcome and record the quality report."""
         try:
-            reader = self._make_qc_reader(file_path, batch)
             result = self._processor.process_file(
                 file_path=file_path,
                 output_base_dir=output_dir,
                 input_base_dir=input_dir,
                 subject_y_limits=subject_y_limits,
-                read_file_func=reader,
+                read_file_func=self._read_file_func,
             )
         except Exception as exc:  # noqa: BLE001 - keep the batch alive on any one file
             outcome = self._classify_error(str(exc))
@@ -182,6 +205,11 @@ class BatchProcessor:
         if result is None:
             logger.warning("No result for %s.", os.path.basename(file_path))
             return "failed"
+
+        quality = result.get("quality")
+        if quality is not None:
+            batch.qc_reports[file_path] = quality
+
         if result.get("success"):
             return "processed"
         if result.get("validation_failed"):
@@ -191,24 +219,6 @@ class BatchProcessor:
         logger.warning("Processing failed: %s (%s)",
                        os.path.basename(file_path), result.get("error", "unknown"))
         return "failed"
-
-    def _make_qc_reader(self, file_path: str, batch: BatchResult) -> Callable:
-        """Wrap the loader so SCI/PSP QC drops bad channels before FileProcessor.
-
-        Returns a ``read_file_func``-compatible callable: it loads the recording,
-        applies channel quality control, stores the QC report on ``batch``, and
-        returns the loaded dict with only the retained OD channels in ``data``.
-        """
-        def reader(path: str) -> dict:
-            loaded = self._read_file_func(path)
-            data = loaded["data"]
-            retained, report = self._qc.apply(data)
-            batch.qc_reports[file_path] = report
-            loaded = dict(loaded)
-            loaded["data"] = retained
-            return loaded
-
-        return reader
 
     # ----- reporting ------------------------------------------------------ #
     def _write_processing_report(self, batch: BatchResult, output_dir: str) -> Path:
@@ -220,8 +230,9 @@ class BatchProcessor:
             f"Total recordings : {batch.total_files}",
             f"Processed        : {batch.n_processed}",
             f"Sampling rate    : {self.fs} Hz",
-            f"QC thresholds    : SCI >= {self.sci_threshold}, PSP >= {self.psp_threshold}",
-            f"SQI filtering    : {'on' if self.enable_sqi_filtering else 'off'}",
+            f"Quality metrics  : {'+'.join(self.enabled_metrics) or 'none'}",
+            f"Thresholds       : SQI>={self.sqi_threshold}, SCI>={self.sci_threshold}, PSP>={self.psp_threshold}",
+            f"Quality filtering: {'on' if self.enable_quality_filtering else 'off'}",
             f"Post-walk trim   : {self.post_walking_trim_seconds} s",
             "",
         ]
