@@ -1,0 +1,83 @@
+"""Peak Spectral Power (PSP) — Pollonini/PHOEBE style.
+References:
+    Pollonini, L., et al. (2014). Auditory cortex activation to natural speech
+    and simulated cochlear implant speech measured with functional near-
+    infrared spectroscopy. Hearing Research, 309, 84-93.
+
+    Pollonini, L., Bortfeld, H., & Oghalai, J. S. (2016). PHOEBE: a method
+    for real-time mapping of optodes-scalp coupling in functional near-
+    infrared spectroscopy. Biomedical Optics Express, 7(12), 5104-5119.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from scipy.signal import butter, csd, filtfilt
+
+
+def _bandpass(x: np.ndarray, fs: float, band: tuple[float, float], order: int) -> np.ndarray:
+    """Zero-phase Butterworth bandpass filter."""
+    nyq = 0.5 * fs
+    low, high = band[0] / nyq, band[1] / nyq
+    if not (0 < low < high < 1):
+        raise ValueError(f"Band {band} Hz incompatible with fs={fs} Hz")
+    b, a = butter(order, [low, high], btype="band")
+    return filtfilt(b, a, x)
+
+
+def _standardize(x: np.ndarray) -> np.ndarray | None:
+    """Z-score to zero mean, unit variance. Returns None if signal is flat."""
+    sd = np.std(x)
+    if sd == 0 or not np.isfinite(sd):
+        return None
+    return (x - np.mean(x)) / sd
+
+
+def peak_spectral_power(
+    od_wl1: np.ndarray,
+    od_wl2: np.ndarray,
+    fs: float,
+    cardiac_band: tuple[float, float] = (0.5, 2.5),
+    filter_order: int = 4,
+    nperseg: int | None = None,
+) -> float:
+    
+    x1 = np.asarray(od_wl1, dtype=float).ravel()
+    x2 = np.asarray(od_wl2, dtype=float).ravel()
+    if x1.shape != x2.shape:
+        raise ValueError("Inputs must be the same length")
+    if x1.size == 0 or not (np.all(np.isfinite(x1)) and np.all(np.isfinite(x2))):
+        return float("nan")
+
+    # filtfilt needs enough samples for edge padding
+    min_len = max(3 * (2 * filter_order + 1), 15)
+    if x1.size < min_len:
+        return float("nan")
+
+    # 1. Bandpass to cardiac band
+    f1 = _bandpass(x1, fs, cardiac_band, filter_order)
+    f2 = _bandpass(x2, fs, cardiac_band, filter_order)
+
+    # 2. Amplitude-normalize
+    z1 = _standardize(f1)
+    z2 = _standardize(f2)
+    if z1 is None or z2 is None:
+        return float("nan")
+
+    # 3. Cross power spectral density via Welch
+    seg = nperseg if nperseg is not None else min(256, len(z1))
+    freqs, pxy = csd(z1, z2, fs=fs, nperseg=seg)
+    mag = np.abs(pxy)
+
+    # 4. Normalize spectrum to sum to 1 (probability-mass form across bins)
+    total = mag.sum()
+    if total == 0 or not np.isfinite(total):
+        return float("nan")
+    spec_norm = mag / total
+
+    # 5. Peak within cardiac band
+    in_band = (freqs >= cardiac_band[0]) & (freqs <= cardiac_band[1])
+    if not np.any(in_band):
+        return float("nan")
+
+    return float(spec_norm[in_band].max())
