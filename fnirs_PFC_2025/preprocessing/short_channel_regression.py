@@ -1,123 +1,73 @@
-"""
-Implements short channel correction (short channel regression) to remove
-superficial components from long-channel fNIRS signals using channel-specific pairing.
-
-References:
-    - Scholkmann et al., 2014 (Physiological Measurement)
-    - Gagnon et al., 2014
-    - Brigadoi et al., 2014
-"""
-
 import pandas as pd
 import numpy as np
-import re
 import logging
 
 logger = logging.getLogger(__name__)
 
+# Keyword groups used to detect a column's chromophore type, independent of
+# which pipeline's naming convention produced it. A column is oxygenated if
+# ANY of these substrings appear in its name, deoxygenated if any of the
+# other group's substrings appear.
+_OXY_KEYS = ("HbO", "O2Hb", "_oxy")
+_DEOXY_KEYS = ("HbR", "HHb", "_deoxy")
+
 
 def scr_regression(long_data: pd.DataFrame, short_data: pd.DataFrame) -> pd.DataFrame:
-    """
-    Apply short channel correction to remove the superficial (skin blood flow) component
-    from long-channel fNIRS measurements using channel-specific pairing.
+    corrected = long_data.copy()
 
-    For each long channel, finds the nearest short channel and performs individual
-    linear regression to remove the superficial component.
+    for type_name, keys in (("oxygenated", _OXY_KEYS), ("deoxygenated", _DEOXY_KEYS)):
+        long_cols = [c for c in long_data.columns if any(k in str(c) for k in keys)]
+        short_cols = [c for c in short_data.columns if any(k in str(c) for k in keys)]
 
-    Parameters
-    ----------
-    long_data : pd.DataFrame
-        DataFrame containing fNIRS data (columns) for the long channels.
-        Each column is typically something like "CH1 HbO", "CH1 HbR", etc.
-        Rows represent timepoints/samples.
-    short_data : pd.DataFrame
-        DataFrame containing fNIRS data (columns) for the short reference channels,
-        measured at superficial depths. Each column is typically "CHx HbO"/"CHx HbR"
-        for short-separation channels (CH7 and CH8 in prefrontal cap).
+        if not long_cols:
+            continue  # nothing of this chromophore type in long_data
 
-    Returns
-    -------
-    long_data_corrected : pd.DataFrame
-        DataFrame with the same shape and columns as `long_data`,
-        but after subtracting the short-channel component.
-    """
-    # Copy to avoid mutating the original data
-    long_data_corrected = long_data.copy()
-    short_data_copy = short_data.copy()
-
-    long_chs = list(long_data.columns)
-
-    for long_ch in long_chs:
-        try:
-            # Find the appropriate short channel for this specific long channel
-            short_ch = _find_matching_short(long_ch, short_data_copy)
-
-            # Extract the signal arrays
-            long_array = np.array(long_data[long_ch], dtype='float64')
-            short_array = np.array(short_data[short_ch], dtype='float64')
-
-            # Compute regression coefficient: beta = (X^T Y) / (X^T X)
-            denom = np.dot(short_array, short_array)
-            if denom == 0:
-                # If short channel is all zeros, skip correction for this channel
-                beta = 0.0
-                logger.warning(f"Short channel {short_ch} has zero variance, skipping correction for {long_ch}")
-            else:
-                beta = np.dot(short_array, long_array) / denom
-
-            # Subtract the superficial component
-            corrected = long_array - (beta * short_array)
-            long_data_corrected[long_ch] = corrected
-
-            logger.debug(f"SCR: {long_ch} corrected using {short_ch} (beta={beta:.4f})")
-
-        except KeyError as e:
-            logger.warning(f"Could not find matching short channel for {long_ch}: {e}")
-            # Keep the original signal if no matching short channel found
-            continue
-        except Exception as e:
-            logger.warning(f"Error processing {long_ch}: {e}")
-            # Keep the original signal if any other error occurs
+        if not short_cols:
+            logger.warning(
+                f"SCR: no {type_name} short-channel reference found in short_data "
+                f"(columns: {list(short_data.columns)}); leaving {long_cols} uncorrected."
+            )
             continue
 
-    return long_data_corrected
+        # Reference regressor: mean across all matching short columns. If the
+        # caller has already pre-averaged (short_data has exactly one column
+        # of this type), this is a no-op mean of a single column.
+        X = short_data[short_cols].mean(axis=1).to_numpy(dtype="float64")
 
+        if not np.all(np.isfinite(X)):
+            logger.warning(
+                f"SCR: {type_name} short-channel reference {short_cols} has non-finite "
+                f"values; skipping correction for {long_cols}."
+            )
+            continue
 
-def _find_matching_short(long_ch: str, short_data: pd.DataFrame) -> str:
-    """
-    Map a long channel to its paired short channel for SCR.
+        # --- OLS WITH INTERCEPT: centre the regressor before estimating beta ---
+        # A DC offset in X now contributes nothing to the slope, so an
+        # absolute-concentration pedestal in the short channel can no longer be
+        # scaled up into the corrected long-channel signal.
+        X_mean = np.mean(X)
+        Xc = X - X_mean
+        denom = np.dot(Xc, Xc)  # == variance(X) * N
 
-    Assumes 0-based channel naming: CH0..CH7
-    True short channels: CH2 and CH6
+        if not np.isfinite(denom) or denom == 0.0:
+            logger.warning(
+                f"SCR: {type_name} short-channel reference {short_cols} has zero "
+                f"variance; skipping correction for {long_cols}."
+            )
+            continue
 
-    IMPORTANT:
-    - If the incoming channel is itself a short channel (CH2/CH6), we refuse to correct it.
-    """
-    short_chs = list(short_data.columns)
+        for long_col in long_cols:
+            Y = long_data[long_col].to_numpy(dtype="float64")
+            if not np.all(np.isfinite(Y)):
+                logger.warning(f"SCR: {long_col} has non-finite values; leaving uncorrected.")
+                continue
 
-    m = re.match(r'CH(\d+)\s+(HbO|HbR|O2Hb|HHb)$', str(long_ch))
-    if not m:
-        raise KeyError(f"Invalid channel format: {long_ch}")
+            Yc = Y - np.mean(Y)
+            beta = np.dot(Xc, Yc) / denom
+            # Subtract only the correlated *varying* superficial component.
+            # Using the centred regressor (Xc) preserves the long channel's own
+            # mean; the short channel's DC is not reintroduced or removed here.
+            corrected[long_col] = Y - beta * Xc
+            logger.debug(f"SCR: {long_col} corrected using mean({short_cols}) (beta={beta:.4f})")
 
-    ch_num = int(m.group(1))
-    chromo = m.group(2)
-
-    SHORT_IDS = {4, 6}
-    if ch_num in SHORT_IDS:
-        raise KeyError(f"{long_ch} is a short channel (CH4/CH6) and should not be SCR-corrected.")
-
-    channel_mapping = {
-        1: 4, 2: 4, 3: 4,  
-        5: 6, 7: 6, 8: 6,   
-    }
-
-    target_short_num = channel_mapping.get(ch_num)
-    if target_short_num is None:
-        raise KeyError(f"No short channel mapping defined for {long_ch} (CH{ch_num}).")
-
-    short_ch_name = f"CH{target_short_num} {chromo}"
-
-    if short_ch_name not in short_chs:
-        raise KeyError(f"Mapped short channel {short_ch_name} not found. Available: {short_chs}")
-
-    return short_ch_name
+    return corrected
