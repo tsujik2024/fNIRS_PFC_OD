@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from typing import Iterable, Optional, Dict, List
 
+
 def average_channels(
     df: pd.DataFrame,
     channels_to_exclude: Optional[Iterable[int]] = None,
@@ -10,31 +11,7 @@ def average_channels(
     right_ids: Optional[Iterable[int]] = None,
     short_ids: Optional[Iterable[int]] = None,
 ) -> pd.DataFrame:
-    """
-    Average multiple fNIRS channels into hemisphere-level and grand-mean signals.
-
-    Assumes columns are named like 'CH{i} HbO' / 'CH{i} HbR' plus optional
-    'Sample number' and 'Event'. Works with zero-based (CH0..) or one-based (CH1..) schemes.
-
-    Parameters
-    ----------
-    channels_to_exclude : iterable of ints, optional
-        Additional channel indices to exclude from all averages.
-    left_ids, right_ids : iterable of ints, optional
-        Explicit hemisphere maps. If omitted, inferred based on numbering scheme.
-    short_ids : iterable of ints, optional
-        Channels to exclude by default as short channels. If omitted, inferred.
-
-    Returns
-    -------
-    ret_df : pd.DataFrame
-        Columns include:
-          - 'Sample number' (if present)
-          - 'Event' (if present)
-          - 'left oxy', 'left deoxy'
-          - 'right oxy', 'right deoxy'
-          - 'grand oxy', 'grand deoxy'
-    """
+    
     if not isinstance(df, pd.DataFrame):
         raise TypeError(f"Must provide a DataFrame, not {type(df)}.")
 
@@ -64,22 +41,22 @@ def average_channels(
 
     # Detect numbering scheme
     zero_based = (0 in present_indices)  # True if CH0 exists
-    # Default hemisphere & short-channel maps (override if provided)
-    if left_ids is None or right_ids is None:
-        if zero_based:
-            # long: 0..5 ; short: 6..7
-            default_left  = [3,4,5]
-            default_right = [0,1,2]
-        else:
-            # long: 1..6 ; short: 7..8
-            default_left  = [4,5,6]
-            default_right = [1,2,3]
-        left_ids  = default_left if left_ids is None else list(left_ids)
-        right_ids = default_right if right_ids is None else list(right_ids)
 
+    # Default hemisphere & short-channel maps (override if provided).
+    # From the montage table (1-based -> 0-based):
+    #   right = montage ch 1,2,3 ('R') = CH0,1,2
+    #   left  = montage ch 5,7,8 ('L') = CH4,6,7
+    #   short = montage ch 4,6         = CH3,5
+    # One-based is the same montage without the -1 shift.
+    if zero_based:
+        default_right, default_left, default_short = [0, 1, 2], [4, 6, 7], [3, 5]
+    else:
+        default_right, default_left, default_short = [1, 2, 3], [5, 7, 8], [4, 6]
+
+    left_ids  = default_left  if left_ids  is None else list(left_ids)
+    right_ids = default_right if right_ids is None else list(right_ids)
     if short_ids is None:
-        # Project-specific: short channels are CH2 and CH6
-        short_ids = [2, 6]
+        short_ids = default_short
 
     # Apply excludes
     excludes = set(int(x) for x in (channels_to_exclude or [])) | set(int(x) for x in short_ids)
@@ -90,7 +67,7 @@ def average_channels(
     def cols_for(ids: Iterable[int], chromo: str) -> List[str]:
         # Accept either 'HbO' or 'O2Hb' as oxy, and 'HbR' or 'HHb' as deoxy
         names = []
-        targets = ('HbO','O2Hb') if chromo == 'oxy' else ('HbR','HHb')
+        targets = ('HbO', 'O2Hb') if chromo == 'oxy' else ('HbR', 'HHb')
         for i in ids:
             for t in targets:
                 col = f'CH{i} {t}'
