@@ -1,20 +1,3 @@
-"""Cross-subject statistics aggregation for processed recordings.
-
-:class:`StatsCollector` reads the grand-average CSVs written by
-:class:`~fnirs_PFC_2025.processing.file_processor.FileProcessor`
-(``*_FULLY_PROCESSED_RAW.csv`` / ``*_FULLY_PROCESSED_ZSCORE.csv``), computes
-per-recording summary statistics, and pools them into per-task tables that span
-all subjects and timepoints.
-
-Subject and timepoint are inferred from the *input path*, not from the file,
-because the same task filename recurs across subjects and sessions. Three folder
-conventions are supported (see :meth:`StatsCollector.extract_metadata`):
-
-1. timepoint as its own subfolder    - ``.../OHSU_Turn_001/Pre/file.txt``
-2. timepoint suffix on a folder name  - ``.../Long_058_V1/file.txt``
-3. fallback: deepest folder as subject, timepoint unknown.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -42,8 +25,19 @@ _SUMMARY_COLUMNS = [
 class StatsCollector:
     """Aggregate per-recording statistics into cross-subject, per-task tables."""
 
-    def __init__(self, fs: float = 50.0) -> None:
+    def __init__(self, fs: float = 50.0, enable_quality_filtering: bool = True) -> None:
+        """
+        Args:
+            fs: Sampling frequency in Hz.
+            enable_quality_filtering: kept for parity with FileProcessor/
+                BatchProcessor/PipelineManager's constructor signatures and for
+                any future filtering-aware statistics; CSV lookup itself no
+                longer depends on this value (see module docstring) since it
+                globs for the processed CSV rather than reconstructing its
+                suffix.
+        """
         self.fs = fs
+        self.enable_quality_filtering = enable_quality_filtering
 
     # ----- public API ----------------------------------------------------- #
     def run_statistics(
@@ -259,21 +253,62 @@ class StatsCollector:
         output_base_dir: str,
         file_type: str,
     ) -> Optional[Path]:
-        """Locate a recording's processed CSV by exact stem in the mirrored tree."""
-        stem = os.path.splitext(os.path.basename(file_path))[0]
-        filename = f"{stem}_FULLY_PROCESSED_{file_type}.csv"
+        """Locate a recording's processed CSV as written by FileProcessor.
+
+        FileProcessor writes to a per-task sub-folder with a quality-filtering
+        suffix that depends on which metrics are enabled (e.g.
+        "_with_SCI_PSP_filtering", "_without_quality_filtering") - rather than
+        reconstruct that suffix here (duplicating FileProcessor's own
+        suffix-building logic, which has already changed once), we glob for the
+        file directly using `basename` and `file_type`, which are already
+        unique per recording without needing the suffix at all::
+
+            {output}/{relative}/{task}<suffix>/{basename}_FULLY_PROCESSED_{type}<suffix>.csv
+
+        e.g. ``DT_with_SCI_PSP_filtering/Turn_001_Walking_DT.txt_FULLY_PROCESSED_RAW_with_SCI_PSP_filtering.csv``
+        """
+        basename = os.path.basename(file_path)  # includes extension, as FileProcessor uses
+        pattern = f"{basename}_FULLY_PROCESSED_{file_type}*.csv"
 
         relative = os.path.relpath(os.path.dirname(file_path), start=input_base_dir)
-        candidate = Path(output_base_dir) / relative / filename
-        if candidate.exists():
-            return candidate
+        search_root = Path(output_base_dir) / relative
+        if search_root.exists():
+            matches = sorted(search_root.rglob(pattern))
+            if matches:
+                if len(matches) > 1:
+                    logger.warning("Multiple %s CSVs matched for %s; using %s",
+                                   file_type, basename, matches[0].name)
+                return matches[0]
 
-        matches = list(Path(output_base_dir).rglob(filename))
-        if len(matches) == 1:
+        # Robust fallback: search the whole output tree in case the folder
+        # layout doesn't mirror the input tree exactly.
+        matches = sorted(Path(output_base_dir).rglob(pattern))
+        if matches:
+            if len(matches) > 1:
+                logger.warning("Multiple %s CSVs matched for %s; using %s",
+                               file_type, basename, matches[0].name)
             return matches[0]
-        if len(matches) > 1:
-            logger.warning("Ambiguous matches for %s; skipping.", filename)
         return None
+
+    @staticmethod
+    def _determine_task_type(filename: str) -> str:
+        """Classify a recording by filename (mirrors FileProcessor's logic)."""
+        s = os.path.basename(filename).upper()
+        if "FTURN" in s or "F_TURN" in s:
+            return "fTurn"
+        if "LSHAPE" in s or "L_SHAPE" in s:
+            return "LShape"
+        if "OBSTACLE" in s:
+            return "Obstacle"
+        if "NAVIGATION" in s or re.search(r"\bNAV\b", s):
+            return "Navigation"
+        if re.search(r"(^|[^A-Z])DT([^A-Z]|$)", s):
+            return "DT"
+        if re.search(r"(^|[^A-Z])ST([^A-Z]|$)", s):
+            return "ST"
+        if "WALK" in s:
+            return "LongWalk"
+        return "Unknown"
 
     def _read_processed_csv(self, path: Path) -> Optional[pd.DataFrame]:
         """Read and validate a processed CSV, or return ``None`` if unusable."""
