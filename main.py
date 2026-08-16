@@ -1,360 +1,216 @@
+"""Command-line entry point for the fNIRS prefrontal-cortex pipeline.
+
+Runs a whole study folder: discovers recordings, and processes each through
+``FileProcessor``, which now performs channel-quality scoring and filtering
+internally (any combination of SQI/SCI/PSP - there is no separate prefilter
+stage anymore), then writes per-task statistics, a QC roll-up, and a
+processing report.
+
+Examples
+--------
+Process a study tree with the default quality metrics (SCI < 0.75 or
+PSP < 0.10 rejected; SQI not computed)::
+
+    python main.py data/ results/
+
+Override the QC thresholds and restrict to two task types::
+
+    python main.py data/ results/ --sci-threshold 0.80 --psp-threshold 0.10 \
+        --task-filter DT ST
+
+Also compute and filter on SQI, alongside SCI/PSP::
+
+    python main.py data/ results/ --metrics sqi sci psp --sqi-threshold 2.5
+
+Compute and report quality without dropping any channels::
+
+    python main.py data/ results/ --no-quality-filtering
 """
-fNIRS Multi-Task Processing Pipeline with Dual SQI Processing and Post-Walking Trimming - Command Line Interface
-"""
+
+from __future__ import annotations
 
 import argparse
 import logging
 import os
 import sys
-from fnirs_PFC_2025.processing.batch_processor import BatchProcessor
+from typing import Optional, Sequence
+
+from fnirs_PFC_2025.processing import PipelineManager
+from fnirs_PFC_2025.processing.quality_control import (
+    DEFAULT_PSP_THRESHOLD,
+    DEFAULT_SCI_THRESHOLD,
+    DEFAULT_SQI_THRESHOLD,
+)
+
+_METRIC_CHOICES = ("sqi", "sci", "psp")
+_DEFAULT_METRICS = ("sci", "psp")  # SQI is opt-in
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the command-line argument parser."""
     parser = argparse.ArgumentParser(
-        description="Process fNIRS data through the complete multi-task pipeline with dual SQI processing and post-walking trimming",
+        description="fNIRS PFC processing pipeline with SQI/SCI/PSP channel quality control.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        epilog="""
-Examples:
-  # Process with dual SQI batches and default 3s post-walking trimming
-  python main.py data/ results/ --dual_sqi
+    )
+    parser.add_argument("input_dir", help="Directory tree containing recordings.")
+    parser.add_argument("output_dir", help="Directory for processed outputs.")
 
-  # Process with custom post-walking trimming
-  python main.py data/ results/ --dual_sqi --post_walking_trim 5.0
+    parser.add_argument("--fs", type=float, default=50.0, help="Sampling rate (Hz).")
 
-  # Process with no post-walking trimming
-  python main.py data/ results/ --dual_sqi --post_walking_trim 0
+    parser.add_argument("--metrics", nargs="+", metavar="METRIC",
+                        choices=_METRIC_CHOICES, default=list(_DEFAULT_METRICS),
+                        help=f"Which quality metrics gate channel exclusion "
+                             f"(choices: {', '.join(_METRIC_CHOICES)}). A channel is "
+                             f"excluded if it fails ANY metric listed here. Metrics not "
+                             f"listed are not computed at all.")
+    parser.add_argument("--sci-threshold", type=float, default=DEFAULT_SCI_THRESHOLD,
+                        help="Reject channels with SCI below this value (only used if "
+                             "'sci' is in --metrics).")
+    parser.add_argument("--psp-threshold", type=float, default=DEFAULT_PSP_THRESHOLD,
+                        help="Reject channels with PSP below this value (only used if "
+                             "'psp' is in --metrics).")
+    parser.add_argument("--sqi-threshold", type=float, default=DEFAULT_SQI_THRESHOLD,
+                        help="Reject channels with SQI below this value (only used if "
+                             "'sqi' is in --metrics).")
+    parser.add_argument("--no-quality-filtering", action="store_true",
+                        help="Compute and report quality metrics but don't drop any "
+                             "channels (default: failing channels are dropped).")
+    parser.add_argument("--exclude-failing-short-channels", action="store_true",
+                        help="Also drop short channels that fail QC (kept by default, "
+                             "since they're used as SCR regressors rather than signal).")
+    parser.add_argument("--post-walking-trim", type=float, default=3.0,
+                        help="Seconds to trim after the walking-start event.")
+    parser.add_argument("--initial-crop", type=float, default=1.0,
+                        help="Seconds to drop from the start of every recording "
+                             "(device/initialization artifacts).")
 
-  # Process only with SQI filtering enabled and custom trimming
-  python main.py data/ results/ --single_batch --sqi_filtering_only --post_walking_trim 2.0
+    parser.add_argument("--task-filter", nargs="+", metavar="TASK",
+                        help="Restrict to specific task types (e.g. DT ST fTurn).")
+    parser.add_argument("--no-consistent-ylimits", action="store_true",
+                        help="Skip the second pass that re-plots with shared y-limits.")
+    parser.add_argument("--list-tasks", action="store_true",
+                        help="List discovered task types and exit.")
 
-  # Process only specific task types with dual SQI and trimming
-  python main.py data/ results/ --task_filter DT ST fTurn LShape --dual_sqi --post_walking_trim 3.0
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="Logging verbosity.")
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help="Suppress console output.")
+    return parser
 
-  # Process with custom parameters and dual SQI
-  python main.py data/ results/ --fs 25.0 --sqi_thresh 2.0 --dual_sqi
 
-  # Original single batch processing (backward compatibility)
-  python main.py data/ results/ --single_batch
-        """
+def configure_logging(level: str, log_file: str, quiet: bool) -> None:
+    """Set up logging to a file and (unless quiet) the console."""
+    handlers: list[logging.Handler] = [logging.FileHandler(log_file, encoding="utf-8")]
+    if not quiet:
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=handlers,
     )
 
-    # Required arguments
-    parser.add_argument("input_dir", help="Directory containing .txt fNIRS files")
-    parser.add_argument("output_dir", help="Directory for processed outputs")
 
-    # Processing parameters
-    parser.add_argument("--fs", type=float, default=50.0, help="Sampling rate in Hz")
-    parser.add_argument("--sqi_thresh", type=float, default=2.0,
-                        help="Signal Quality Index threshold for quality assessment (1-5 scale)")
-
-    # Post-walking trimming parameter
-    parser.add_argument("--post_walking_trim", type=float, default=3.0,
-                        help="Seconds to trim after walking start event for quality control (default: 3.0)")
-
-    # Multi-task options
-    parser.add_argument("--task_filter", nargs='+', metavar='TASK',
-                        help="Filter to specific task types (e.g., DT ST fTurn LShape Figure8 Obstacle Navigation)")
-    parser.add_argument("--strict_validation", action='store_true',
-                        help="Enable strict validation (reject files without sufficient event markers)")
-    parser.add_argument("--list_tasks", action='store_true',
-                        help="List all detected task types and exit")
-
-    # SQI Processing options
-    parser.add_argument("--dual_sqi", action='store_true', default=True,
-                        help="Enable dual SQI processing (process each file twice: with and without SQI filtering)")
-    parser.add_argument("--single_batch", action='store_true',
-                        help="Use single batch processing instead of dual SQI processing")
-    parser.add_argument("--sqi_filtering_only", action='store_true',
-                        help="When using single batch, only process with SQI filtering enabled")
-
-    # Logging options
-    parser.add_argument("--log_level", default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-                        help="Logging verbosity level")
-    parser.add_argument("--quiet", "-q", action='store_true',
-                        help="Suppress console output (log to file only)")
-    parser.add_argument("--verbose", "-v", action='store_true',
-                        help="Enable verbose output (show detailed processing steps)")
-
-    args = parser.parse_args()
-
-    # Validate arguments
-    if args.dual_sqi and args.single_batch:
-        print(" Error: Cannot use both --dual_sqi and --single_batch options")
-        return 1
-
-    if args.sqi_filtering_only and not args.single_batch:
-        print(" Error: --sqi_filtering_only can only be used with --single_batch")
-        return 1
-
-    # Validate trimming parameter
-    if args.post_walking_trim < 0:
-        print(" Error: Post-walking trim cannot be negative")
-        return 1
-
-    # Set dual_sqi to False if single_batch is requested
-    if args.single_batch:
-        args.dual_sqi = False
-
-    # Validate input directory
-    if not os.path.exists(args.input_dir):
-        print(f" Error: Input directory '{args.input_dir}' does not exist")
-        return 1
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Entry point. Returns a process exit code (0 ok, 1 error, 2 nothing done)."""
+    args = build_parser().parse_args(argv)
 
     if not os.path.isdir(args.input_dir):
-        print(f" Error: '{args.input_dir}' is not a directory")
+        print(f"Error: input directory not found: {args.input_dir}", file=sys.stderr)
         return 1
-
-    # Create output directory if it doesn't exist
+    if args.post_walking_trim < 0:
+        print("Error: --post-walking-trim cannot be negative.", file=sys.stderr)
+        return 1
+    if args.initial_crop < 0:
+        print("Error: --initial-crop cannot be negative.", file=sys.stderr)
+        return 1
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Configure logging
-    log_file = os.path.join(args.output_dir, "fnirs_processing.log")
-    handlers = [logging.FileHandler(log_file)]
-    if not args.quiet:
-        handlers.append(logging.StreamHandler())
+    configure_logging(args.log_level, os.path.join(args.output_dir, "fnirs_processing.log"), args.quiet)
+    logger = logging.getLogger("fnirs_PFC_2025.main")
 
-    log_level = "DEBUG" if args.verbose else args.log_level
-    logging.basicConfig(
-        level=log_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=handlers
+    manager = PipelineManager(
+        fs=args.fs,
+        sqi_threshold=args.sqi_threshold,
+        sci_threshold=args.sci_threshold,
+        psp_threshold=args.psp_threshold,
+        enabled_metrics=tuple(args.metrics),
+        enable_quality_filtering=not args.no_quality_filtering,
+        exclude_failing_short_channels=args.exclude_failing_short_channels,
+        post_walking_trim_seconds=args.post_walking_trim,
+        initial_crop_seconds=args.initial_crop,
     )
 
-    logger = logging.getLogger(__name__)
-
-    # Initialize processor with trimming parameter
-    try:
-        processor = BatchProcessor(
-            fs=args.fs,
-            sqi_threshold=args.sqi_thresh,
-            post_walking_trim_seconds=args.post_walking_trim
-        )
-    except Exception as e:
-        print(f" Error initializing processor: {str(e)}")
-        return 1
-
-    # Handle --list_tasks option
     if args.list_tasks:
-        print(" Scanning for task types...")
-        try:
-            task_files = processor.find_input_files(args.input_dir, args.task_filter)
-            if task_files:
-                print("\n Detected task types:")
-                total_files = 0
-                for task_type, files in sorted(task_files.items()):
-                    print(f"  {task_type}: {len(files)} files")
-                    total_files += len(files)
-                print(f"\nTotal: {total_files} files")
-                print(f"Post-walking trimming: {args.post_walking_trim}s")
+        return _list_tasks(manager, args)
 
-                if args.dual_sqi:
-                    print(f"\n With dual SQI processing, each file will be processed twice:")
-                    print(f"  - Total processing operations: {total_files * 2}")
-                    print(f"  - Batch 1: All channels included")
-                    print(f"  - Batch 2: Poor quality channels (SQI < {args.sqi_thresh}) excluded")
-                    print(f"  - Both batches: {args.post_walking_trim}s trimmed after walking start")
-            else:
-                print("️ No .txt files found in input directory")
-            return 0
-        except Exception as e:
-            print(f" Error scanning files: {str(e)}")
-            return 1
-
-    # Determine processing method
-    processing_method = "DUAL SQI PROCESSING" if args.dual_sqi else "SINGLE BATCH PROCESSING"
-    sqi_filter_status = ""
-    if args.single_batch:
-        if args.sqi_filtering_only:
-            sqi_filter_status = " (SQI filtering ENABLED)"
-        else:
-            sqi_filter_status = " (SQI filtering DISABLED)"
-
-    # Log startup information
-    logger.info("=" * 80)
-    logger.info(f"fNIRS Multi-Task Processing Pipeline Started - {processing_method}")
-    logger.info("=" * 80)
-    logger.info(f"Input directory: {args.input_dir}")
-    logger.info(f"Output directory: {args.output_dir}")
-    logger.info(f"Processing method: {processing_method}{sqi_filter_status}")
-    logger.info(f"Sampling rate: {args.fs} Hz")
-    logger.info(f"SQI threshold: {args.sqi_thresh}")
-    logger.info(f"Post-walking trimming: {args.post_walking_trim}s")
-    logger.info(f"Task filter: {args.task_filter if args.task_filter else 'All tasks'}")
-    logger.info(f"Strict validation: {args.strict_validation}")
-    logger.info(f"Log level: {log_level}")
-    logger.info(f"Log file: {log_file}")
-    logger.info("=" * 80)
-
-    if not args.quiet:
-        print(" Starting fNIRS Multi-Task Processing Pipeline")
-        print(f" Input: {args.input_dir}")
-        print(f" Output: {args.output_dir}")
-        print(f"  Method: {processing_method}{sqi_filter_status}")
-
-        if args.dual_sqi:
-            print(" Dual SQI Processing:")
-            print("   - Batch 1: All channels included in analysis")
-            print("   - Batch 2: Poor quality channels (SQI < threshold) excluded from analysis")
-            print(f"   - SQI threshold: {args.sqi_thresh}")
-
-        print(f" Post-walking trimming: {args.post_walking_trim}s after walking start event")
-
-        if args.task_filter:
-            print(f" Processing only: {', '.join(args.task_filter)}")
-        if args.strict_validation:
-            print(" Strict validation enabled (event-dependent tasks require sufficient markers)")
-        print(f" Logging to: {log_file}")
-
+    logger.info("Starting study run: input=%s output=%s", args.input_dir, args.output_dir)
     try:
-        # Run the pipeline using BatchProcessor's two-pass method
-        results = processor.run_two_pass_processing(
+        study = manager.run(
             input_dir=args.input_dir,
             output_dir=args.output_dir,
             task_filter=args.task_filter,
-            strict_validation=args.strict_validation,
-            enable_dual_sqi=args.dual_sqi
+            consistent_ylimits=not args.no_consistent_ylimits,
+            show_progress=not args.quiet,
         )
-
-        # Display results based on processing mode
-        if not args.quiet:
-            print("\n" + "=" * 80)
-
-            if args.dual_sqi:
-                print(" DUAL SQI PROCESSING COMPLETE!")
-                print("=" * 80)
-                print(f" Input directory: {args.input_dir}")
-                print(f" Output directory: {args.output_dir}")
-                print(f" Total files found: {results['total_files']}")
-                print(f" Post-walking trimming: {args.post_walking_trim}s applied to both batches")
-
-                print(f"\n BATCH 1 RESULTS (All Channels):")
-                print(f"  Files processed: {len(results['batch1_processed'])}/{results['total_files']}")
-                if results['total_files'] > 0:
-                    success_rate1 = len(results['batch1_processed']) / results['total_files'] * 100
-                    print(f"  Success rate: {success_rate1:.1f}%")
-
-                print(f"\n📉 BATCH 2 RESULTS (SQI Filtered):")
-                print(f"  Files processed: {len(results['batch2_processed'])}/{results['total_files']}")
-                if results['total_files'] > 0:
-                    success_rate2 = len(results['batch2_processed']) / results['total_files'] * 100
-                    print(f"  Success rate: {success_rate2:.1f}%")
-
-                # Show task-specific results for both batches
-                print(f"\n Results by Task Type:")
-                for task_type in sorted(results['task_results']['no_sqi_filtering']['processed'].keys()):
-                    batch1_processed = len(results['task_results']['no_sqi_filtering']['processed'][task_type])
-                    batch2_processed = len(results['task_results']['with_sqi_filtering']['processed'][task_type])
-                    batch1_validation_failed = len(
-                        results['task_results']['no_sqi_filtering']['validation_failed'][task_type])
-                    batch2_validation_failed = len(
-                        results['task_results']['with_sqi_filtering']['validation_failed'][task_type])
-
-                    if batch1_processed + batch2_processed + batch1_validation_failed + batch2_validation_failed > 0:
-                        print(f"  {task_type}:")
-                        print(
-                            f"    All channels: {batch1_processed} processed, {batch1_validation_failed} validation failed")
-                        print(
-                            f"    SQI filtered:  {batch2_processed} processed, {batch2_validation_failed} validation failed")
-
-                # Output file information - FIXED for new return structure
-                print(f"\n Output Files Generated:")
-
-                # RAW statistics files
-                if results.get('stats_batch1_raw') is not None:
-                    print(f"   RAW statistics (no SQI filtering): all_subjects_statistics_RAW_no_SQI_filtering.csv")
-                if results.get('stats_batch2_raw') is not None:
-                    print(
-                        f"   RAW statistics (with SQI filtering): all_subjects_statistics_RAW_with_SQI_filtering.csv")
-
-                # Z-score statistics files
-                if results.get('stats_batch1_zscore') is not None:
-                    print(
-                        f"   Z-score statistics (no SQI filtering): all_subjects_statistics_ZSCORE_no_SQI_filtering.csv")
-                if results.get('stats_batch2_zscore') is not None:
-                    print(
-                        f"   Z-score statistics (with SQI filtering): all_subjects_statistics_ZSCORE_with_SQI_filtering.csv")
-
-                print(f"   Processing report: dual_batch_processing_report.txt")
-                print(f"   Log file: {os.path.basename(log_file)}")
-
-            else:
-                # Single batch processing results
-                print(" SINGLE BATCH PROCESSING COMPLETE!")
-                print("=" * 80)
-                print(f" Input directory: {args.input_dir}")
-                print(f" Output directory: {args.output_dir}")
-
-                sqi_status = " (SQI Filtered)" if args.sqi_filtering_only else " (All Channels)"
-                processed_count = len(results['processed_files'])
-                total_count = results['total_files']
-                print(f" Files processed{sqi_status}: {processed_count}/{total_count}")
-                print(f" Post-walking trimming: {args.post_walking_trim}s applied to all files")
-
-                if total_count > 0:
-                    success_rate = processed_count / total_count * 100
-                    print(f" Overall success rate: {success_rate:.1f}%")
-
-                if results.get('skipped_files'):
-                    print(f" Total skipped/failed: {len(results['skipped_files'])}")
-
-                # FIXED: Handle both RAW and ZSCORE stats for single batch
-                print(f"\n Output Files Generated:")
-                if results.get('stats_raw') is not None:
-                    print(f"   RAW statistics: all_subjects_statistics_RAW.csv")
-                if results.get('stats_zscore') is not None:
-                    print(f"   Z-score statistics: all_subjects_statistics_ZSCORE.csv")
-
-                print(f"   Processing report: task_processing_report.txt")
-                print(f"  Log file: {os.path.basename(log_file)}")
-
-            print("=" * 80)
-
-        # Log completion
-        logger.info("Pipeline completed successfully")
-        if args.dual_sqi:
-            logger.info(
-                f"Dual SQI processing: Batch 1: {len(results['batch1_processed'])}, Batch 2: {len(results['batch2_processed'])}")
-        else:
-            logger.info(f"Single batch processing: {len(results['processed_files'])} files processed")
-
-        logger.info(f"Post-walking trimming: {args.post_walking_trim}s applied to all processed files")
-
-        # Return appropriate exit code
-        if args.dual_sqi:
-            return 0 if (results['batch1_processed'] or results['batch2_processed']) else 2
-        else:
-            return 0 if results['processed_files'] else 2
-
-    except KeyboardInterrupt:
-        error_msg = "Pipeline interrupted by user"
-        logger.warning(error_msg)
-        if not args.quiet:
-            print(f"\n  {error_msg}")
-        return 130  # Standard exit code for SIGINT
-
-    except FileNotFoundError as e:
-        error_msg = f"File not found: {str(e)}"
-        logger.critical(error_msg)
-        if not args.quiet:
-            print(f" Error: {error_msg}")
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - top-level CLI guard
+        logger.critical("Pipeline failed: %s", exc, exc_info=True)
+        print(f"Error: pipeline failed: {exc}", file=sys.stderr)
         return 1
 
-    except PermissionError as e:
-        error_msg = f"Permission denied: {str(e)}"
-        logger.critical(error_msg)
-        if not args.quiet:
-            print(f" Error: {error_msg}")
-        return 1
+    _print_summary(study, args)
+    return 0 if study.n_processed else 2
 
-    except Exception as e:
-        error_msg = f"Pipeline failed: {str(e)}"
-        logger.critical(error_msg, exc_info=True)
-        if not args.quiet:
-            print(f" Error: {error_msg}")
-            print(f" Check log file for details: {log_file}")
-        return 1
+
+# ----- helpers ------------------------------------------------------------ #
+def _list_tasks(manager: PipelineManager, args: argparse.Namespace) -> int:
+    """Print discovered task types and exit."""
+    grouped = manager._batch.find_input_files(args.input_dir, args.task_filter)
+    if not grouped:
+        print("No matching files found.")
+        return 2
+    print("Discovered task types:")
+    for task, files in sorted(grouped.items()):
+        print(f"  {task}: {len(files)} file(s)")
+    print(f"Total: {sum(len(f) for f in grouped.values())} file(s)")
+    return 0
+
+
+def _print_summary(study, args: argparse.Namespace) -> None:
+    """Print a concise end-of-run summary to stdout."""
+    if args.quiet:
+        return
+    metrics = "+".join(m.upper() for m in args.metrics) or "none"
+    thresholds = []
+    if "sqi" in args.metrics:
+        thresholds.append(f"SQI >= {args.sqi_threshold}")
+    if "sci" in args.metrics:
+        thresholds.append(f"SCI >= {args.sci_threshold}")
+    if "psp" in args.metrics:
+        thresholds.append(f"PSP >= {args.psp_threshold}")
+    filtering = "off (report only)" if args.no_quality_filtering else "on"
+
+    print("\n" + "=" * 60)
+    print("PROCESSING COMPLETE")
+    print("=" * 60)
+    print(f"Input            : {args.input_dir}")
+    print(f"Output           : {args.output_dir}")
+    print(f"Quality metrics  : {metrics}")
+    print(f"QC thresholds    : {', '.join(thresholds) if thresholds else 'n/a'}")
+    print(f"Quality filtering: {filtering}")
+    print(f"Recordings       : {study.n_processed}/{study.total_files} processed")
+    if study.stats_raw is not None:
+        print("RAW statistics   : all_subjects_statistics_RAW.csv")
+    if study.stats_zscore is not None:
+        print("ZSCORE statistics: all_subjects_statistics_ZSCORE.csv")
+    print(f"Per-task sheets  : {len(study.summary_paths)} written")
+    if study.qc_summary_path is not None:
+        print("QC roll-up       : qc_summary_all_recordings.csv")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    exit(main())
+    sys.exit(main())
