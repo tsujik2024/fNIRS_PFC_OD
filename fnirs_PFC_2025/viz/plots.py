@@ -56,6 +56,8 @@ def plot_overall_signals(
     pooled: List[float] = []
     for signal, colour, label in ((hbo, "red", "HbO"), (hbr, "blue", "HbR")):
         if signal is None:
+            logger.warning("No %s-matching column found in frame for '%s'; that trace will be missing.",
+                            label, _compose_title(title, subject, condition).replace("\n", " "))
             continue
         mask = ~np.isnan(signal)
         ax.plot(time[mask], signal[mask], color=colour, label=label, linewidth=1.5)
@@ -116,25 +118,6 @@ def plot_channels_separately(
     return fig, axis_list, y_lim
 
 
-def calculate_global_ylim(
-    frames: Sequence[pd.DataFrame],
-    include_keys: Optional[Sequence[str]] = None,
-) -> Optional[YLim]:
-    """Pool signal columns across frames to derive shared y-limits, or ``None``."""
-    keys = tuple(include_keys) if include_keys else _SIGNAL_KEYS
-    pooled: List[float] = []
-    for frame in frames:
-        if not hasattr(frame, "columns"):
-            continue
-        for column in frame.columns:
-            if any(k in column for k in keys):
-                values = pd.to_numeric(frame[column], errors="coerce").to_numpy()
-                pooled.extend(values[np.isfinite(values)].tolist())
-    if not pooled:
-        return None
-    return _padded_limits(pooled)
-
-
 # ----- internals ---------------------------------------------------------- #
 def _mean_signal(frame: pd.DataFrame, keywords: Sequence[str]) -> Optional[np.ndarray]:
     """Average all columns whose name contains any keyword, coercing to numeric."""
@@ -187,6 +170,12 @@ def _plot_single_channel(ax: Axes, series_by_species: dict, channel_id: str,
             values = series_by_species[key].to_numpy()
             if len(values) == len(time):
                 ax.plot(time, values, colour, label=f"{channel_id} {key}")
+            else:
+                logger.warning(
+                    "%s %s has %d samples but the time axis has %d; skipping that trace "
+                    "instead of plotting misaligned data.",
+                    channel_id, key, len(values), len(time),
+                )
             break
 
 
