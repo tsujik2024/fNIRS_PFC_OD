@@ -3,12 +3,12 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
-from typing import Optional, Dict, Tuple, Callable, List
+from typing import Optional, Dict, Tuple, Callable, List, Iterable
 import logging
 import re
 # Import processing steps
 from fnirs_PFC_2025.preprocessing.z_transformation import z_transformation
-from fnirs_PFC_2025.preprocessing.fir_filter import fir_filter
+from fnirs_PFC_2025.preprocessing.butterworth_filter import butterworth_bandpass
 from fnirs_PFC_2025.preprocessing.short_channel_regression import scr_regression
 from fnirs_PFC_2025.preprocessing.tddr import tddr
 from fnirs_PFC_2025.preprocessing.baseline_correction import baseline_subtraction
@@ -26,11 +26,19 @@ from fnirs_PFC_2025.viz.plots import plot_channels_separately, plot_overall_sign
 logger = logging.getLogger(__name__)
 plt.ioff()  # Non-interactive backend
 
-# Short channel IDs to exclude from averaging/regression grouping.
-# 0-based channel indices. Project convention (see quality_control.py,
-# BatchProcessor, PipelineManager): the OctaMon short channels labelled
-# 4 and 6 in 1-based optode numbering are CH3 and CH5 here (0-based).
-SHORT_CHANNEL_IDS = {3, 5}
+# Montage (0-based channel numbering). Optode order on the cap is
+# 1(R) 2(R) 3(R) 4(short) 5(L) 6(short) 7(L) 8(L) in 1-based numbering.
+# Channel 6 falls inside the left block, so I'm treating it as the left
+# short channel, which leaves channel 4 (right after the right block) as
+# the right short channel. That's my best read of the layout, not
+# something I've confirmed against the probe documentation. If SCR
+# results look off, double check the cap layout first and swap these two
+# constants if the assignment turns out to be backwards.
+RIGHT_LONG_IDS = (0, 1, 2)
+LEFT_LONG_IDS = (4, 6, 7)
+RIGHT_SHORT_ID = 3
+LEFT_SHORT_ID = 5
+SHORT_CHANNEL_IDS = {RIGHT_SHORT_ID, LEFT_SHORT_ID}
 
 
 class FileProcessor:
@@ -43,29 +51,43 @@ class FileProcessor:
                  enable_quality_filtering: bool = True,
                  exclude_failing_short_channels: bool = False,
                  post_walking_trim_seconds: float = 3.0,
-                 initial_crop_seconds: float = 1.0):
+                 initial_crop_seconds: float = 1.0,
+                 skip_diagnostic_plots: bool = False,
+                 compute_zscore: bool = True):
         """
-        Initialize processor with parameters.
+        Set up a processor for one run of the pipeline.
 
-        Args:
-            fs: Sampling frequency in Hz
-            sqi_threshold: SQI threshold for quality assessment (1-5 scale, default 2.0)
-            sci_threshold: Scalp Coupling Index threshold (default 0.75, Pollonini/PHOEBE)
-            psp_threshold: Peak Spectral Power threshold (default 0.10, Pollonini/PHOEBE)
-            enabled_metrics: which of "sqi", "sci", "psp" participate in the pass/fail
-                decision. Metrics not listed here are not computed at all. Default
-                ("sci", "psp") - SQI is opt-in.
-            enable_quality_filtering: If True (default), channels that fail an enabled
-                metric are dropped from SCR/FIR/baseline/output. If False, quality is
-                still computed and reported, but no channels are removed.
-            exclude_failing_short_channels: If True, short channels (CH3/CH5) that fail
-                are also dropped. Default False - short channels are kept regardless of
-                quality since they're used as SCR regressors, not signal.
-            post_walking_trim_seconds: Seconds to trim after walking start event for quality control (default 3.0)
-            initial_crop_seconds: Seconds to drop from the START of every recording
-                (device/initialization artifacts), applied before anything else - events,
-                quality metrics, TDDR, etc. all see the already-cropped recording.
-                Default 1.0s, matching FullCapProcessor's initial crop.
+        fs is the sampling rate in Hz. sqi_threshold, sci_threshold and
+        psp_threshold are the pass/fail cutoffs for the three quality
+        metrics (SQI is on a 1-5 scale, default 2.0; SCI and PSP default to
+        the Pollonini/PHOEBE values of 0.75 and 0.10). Only the metrics
+        named in enabled_metrics actually get computed - anything not in
+        that tuple is skipped entirely, not just ignored. Default is
+        ("sci", "psp"); SQI has to be turned on explicitly.
+
+        enable_quality_filtering controls whether a channel that fails gets
+        dropped from SCR/bandpass/baseline/output, or just flagged in the
+        report while staying in the data (default is to drop it).
+        exclude_failing_short_channels is a separate switch for CH3/CH5
+        specifically - by default they're kept even if they fail, since
+        they're only used as SCR regressors and never end up in the signal.
+
+        post_walking_trim_seconds is how much to cut after the walking-start
+        marker (3.0s default). initial_crop_seconds trims the very start of
+        every recording for device warm-up artifacts, before anything else
+        touches the data - events, quality metrics, TDDR, all of it see the
+        already-cropped recording. Defaults to 1.0s to match
+        FullCapProcessor.
+
+        skip_diagnostic_plots turns off the five per-stage plots (Post-MBLL,
+        Post-TDDR, Post-SCR, Post-Filter, Post-Baseline) plus the combined
+        summary panel - these are debugging aids, so the raw-concentration
+        plot and the final RAW/ZSCORE plots still get made regardless.
+        Defaults to False, i.e. plots are on.
+
+        compute_zscore, if set to False, skips Z-transformation altogether:
+        no Z-scored averaging, no ZSCORE csv, no Z-score plot, just the RAW
+        output. Defaults to True so both get produced, same as before.
         """
         self.fs = fs
         self.sqi_threshold = sqi_threshold
@@ -80,6 +102,8 @@ class FileProcessor:
         self.exclude_failing_short_channels = exclude_failing_short_channels
         self.post_walking_trim_seconds = post_walking_trim_seconds
         self.initial_crop_seconds = initial_crop_seconds
+        self.skip_diagnostic_plots = skip_diagnostic_plots
+        self.compute_zscore = compute_zscore
 
         # Define task types and their walking start events
         self.task_walking_events = {
@@ -143,9 +167,7 @@ class FileProcessor:
 
         long_cols = []
         for col in columns:
-            # Check if it's a concentration column
             if any(kw in col for kw in keywords) and 'grand' not in col.lower():
-                # Check if it's NOT a short channel
                 if not self._is_short_channel(col):
                     long_cols.append(col)
         return long_cols
@@ -154,53 +176,44 @@ class FileProcessor:
                      file_path: str,
                      output_base_dir: str,
                      input_base_dir: str,
-                     subject_y_limits: Optional[Dict] = None,
                      read_file_func: Callable = None,
                      baseline_duration: Optional[float] = None,
                      ) -> Optional[Dict]:
         """
-        Process a single fNIRS file through the complete pipeline with optional SQI filtering and post-walking trimming.
+        Run one fNIRS file all the way through the pipeline - quality
+        filtering and post-walking trimming included.
 
-        Returns:
-            Dict with keys:
-                - 'success': bool indicating if processing succeeded
-                - 'data': DataFrame with processed data (if success=True)
-                - 'subject': str subject ID (if success=True)
-                - 'task_type': str task type (if success=True)
-                - 'error': str error message (if success=False)
+        On success, returns a dict with success=True, data (the processed
+        DataFrame), subject, task_type, and whatever quality report got
+        generated along the way. On failure, success is False and error
+        holds a message explaining why.
         """
         try:
             self._event_index_remap = None
             self._last_quality_report = None
-            # ─── Setup paths & names ───────────────────────────
             output_dir = self._create_output_dir(output_base_dir, input_base_dir, file_path)
             file_basename = os.path.basename(file_path)
             subject = self._extract_subject(file_path)
-            raw_limits = self._get_plotting_limits(subject, subject_y_limits)
 
-            # Store file_basename for use in fallback timing
             self._current_file_basename = file_basename
 
-            logger.info(f" Starting: {file_path} (quality filtering: {'ON' if self.enable_quality_filtering else 'OFF'}, "
-                        f"post-walking trim: {self.post_walking_trim_seconds}s)")
+            logger.info(f"Starting: {file_path}")
 
-            # ─── 1) Load raw data ───────────────────────────────
+            # 1) Load raw data
             data_dict = read_file_func(file_path)
             if not data_dict or 'data' not in data_dict:
-                logger.error(f" read_file_func failed or returned no 'data' for: {file_path}")
+                logger.error(f"read_file_func failed or returned no 'data' for: {file_path}")
                 return {'success': False, 'error': 'Failed to read data from file'}
 
             raw_df = data_dict['data']
             if raw_df is None or not isinstance(raw_df, pd.DataFrame):
-                logger.error(f" Invalid DataFrame returned for: {file_path}")
+                logger.error(f"Invalid DataFrame returned for: {file_path}")
                 return {'success': False, 'error': 'Invalid DataFrame returned'}
 
             data = self._prepare_data(raw_df)
             if data is None or data.empty:
-                logger.error(f" Prepared data is empty for: {file_path}")
+                logger.error(f"Prepared data is empty for: {file_path}")
                 return {'success': False, 'error': 'Prepared data is empty'}
-
-            logger.debug(f" Loaded {len(data)} rows × {len(data.columns)} cols")
 
             # Drop the first `initial_crop_seconds` of the recording (device/
             # initialization artifacts), matching FullCapProcessor. Everything
@@ -208,38 +221,33 @@ class FileProcessor:
             # only the already-cropped recording.
             data = self._drop_initial_seconds(data, self.initial_crop_seconds)
             if data is None or data.empty:
-                logger.error(f" Data empty after initial-seconds crop for: {file_path}")
+                logger.error(f"Data empty after initial-seconds crop for: {file_path}")
                 return {'success': False, 'error': 'Data empty after initial-seconds crop'}
 
-            # ─── 2) Metadata ────────────────────────────────────
+            # 2) Metadata
             metadata = data_dict.get('metadata', {})
             subject_id = metadata.get('Subject Public ID')
             record_date = metadata.get('Record Date/Time')
             sample_rate = int(self.fs)
 
-            # ─── 3) Determine task type ─────────────────────────
+            # 3) Determine task type
             task_type = self._determine_task_type(file_basename)
-            logger.debug(f"Detected task type: {task_type}")
 
             task_config = self.task_types.get(task_type, {'type': 'unknown', 'min_events': 2})
 
-            # Log timing info for this file
             timing = self._get_task_timing(file_basename, task_type)
-            logger.info(f"Task timing for {file_basename}: {timing['total_expected']}s total "
-                        f"({timing['baseline_duration']}s baseline + {timing['task_duration']}s task + "
-                        f"{timing['end_duration']}s end)")
 
-            # ─── 4) Extract and clean events ──────────────────────────────
+            # 4) Extract and clean events
             events = self._extract_and_clean_events(data_dict, data)
 
-            # ─── 5) Validate task requirements ──────────────────────────────
+            # 5) Validate task requirements
             if not self._validate_task_requirements(task_type, task_config, events, file_basename):
-                logger.error(f" Task requirements not met for {file_basename}")
+                logger.error(f"Task requirements not met for {file_basename}")
                 return {'success': False, 'error': 'Task validation failed', 'validation_failed': True}
 
-            # ─── 6) Processing pipeline with SQI filtering ───────
-            # NOTE: "Raw" concentration plotting now happens INSIDE _process_pipeline_stages
-            # after Beer-Lambert conversion (pre-TDDR) but before TDDR/SCR/filtering
+            # 6) Processing pipeline with SQI filtering.
+            # "Raw" concentration plotting happens INSIDE _process_pipeline_stages,
+            # after Beer-Lambert conversion (pre-TDDR) but before TDDR/SCR/filtering.
             processed_data = self._process_pipeline_stages(
                 data=data,
                 output_dir=output_dir,
@@ -247,23 +255,22 @@ class FileProcessor:
                 events=events,
                 task_type=task_type,
                 subject=subject,
-                global_ylim=raw_limits
             )
             if processed_data is None or processed_data.empty:
-                logger.error(f" Pipeline stages returned empty for: {file_path}")
+                logger.error(f"Pipeline stages returned empty for: {file_path}")
                 return {'success': False, 'error': 'Pipeline processing returned empty data'}
 
-            # ─── 7) Final outputs with post-walking trimming ───────────────────────────────
+            # 7) Final outputs with post-walking trimming
             final_df = self._finalize_outputs(
                 processed_data, output_dir, file_basename, subject,
                 task_type, task_config, events
             )
 
             if final_df is None or final_df.empty:
-                logger.error(f" _finalize_outputs failed for: {file_path}")
+                logger.error(f"_finalize_outputs failed for: {file_path}")
                 return {'success': False, 'error': 'Finalize outputs failed'}
 
-            logger.info(f" Finished processing: {file_path}")
+            logger.info(f"Finished processing: {file_path}")
             return {
                 'success': True,
                 'data': final_df,
@@ -274,223 +281,147 @@ class FileProcessor:
             }
 
         except Exception as e:
-            logger.error(f" Exception in process_file for {file_path}: {e}", exc_info=True)
+            logger.error(f"Exception in process_file for {file_path}: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
 
     def _get_task_timing(self, file_basename: str, task_type: str) -> dict:
         """
-        Get expected timing parameters based on FILENAME (not just task type).
-
-        This handles the distinction between:
-          - 90s tasks: Turn_DT, Turn_ST, Walking_DT-AC, Walking_DT-TMB, Walking_DT_DM
-          - 150s tasks: plain Walking_DT, Walking_ST, DT, ST
-
-        Args:
-            file_basename: Original filename for pattern matching
-            task_type: Detected task type
-
-        Returns:
-            Dict with baseline_duration, task_duration, end_duration, total_expected
+        Work out expected baseline/task/end durations from the filename
+        itself, not just the task_type label - we need this distinction
+        because Turn_DT, Turn_ST, Walking_DT-AC, Walking_DT-TMB and
+        Walking_DT_DM are all 90s tasks, while plain Walking_DT, Walking_ST,
+        DT and ST run 150s. Returns a dict with baseline_duration,
+        task_duration, end_duration and total_expected.
         """
         s = file_basename.upper()
 
-        # --- 90-second tasks (20s baseline + 60s task + 10s end) ---
-        # Turn_DT, Turn_ST (walking turn tasks, NOT fTurn)
+        # 90s tasks: 20s baseline + 60s task + 10s end.
+        # Turn_DT / Turn_ST are walking-turn tasks, not fTurn - keep them separate.
         if re.search(r'TURN[_-]?(DT|ST)', s) and 'FTURN' not in s and 'F_TURN' not in s:
-            logger.debug(f"Timing: 90s (Turn walking task)")
-            return {
-                "baseline_duration": 20.0,
-                "task_duration": 60.0,
-                "end_duration": 10.0,
-                "total_expected": 90.0
-            }
+            return {"baseline_duration": 20.0, "task_duration": 60.0, "end_duration": 10.0, "total_expected": 90.0}
 
-        # Walking_DT with suffixes: DT-AC, DT-TMB, DT_DM, ST-AC, etc.
-        # Match DT or ST followed by a hyphen or underscore and more letters
-        if re.search(r'(DT|ST)[_-](AC|TMB|DM)\b', s):
-            logger.debug(f"Timing: 90s (DT/ST variant task)")
-            return {
-                "baseline_duration": 20.0,
-                "task_duration": 60.0,
-                "end_duration": 10.0,
-                "total_expected": 90.0
-            }
+        # Walking_DT variants with a suffix (DT-AC, DT-TMB, DT_DM, ST-AC...).
+        # I switched to a negative lookahead here instead of \b because \w
+        # counts underscore as a word char, so \b was silently failing to
+        # match whenever the suffix was itself followed by another
+        # underscore - which is basically always, since these filenames
+        # keep going with "_OD" or similar right after. That meant this
+        # branch just never fired on real data before this fix.
+        if re.search(r'(DT|ST)[_-](AC|TMB|DM)(?![A-Z])', s):
+            return {"baseline_duration": 20.0, "task_duration": 60.0, "end_duration": 10.0, "total_expected": 90.0}
 
-        # --- 150-second tasks (20s baseline + 120s task + 10s end) ---
+        # 150s tasks: 20s baseline + 120s task + 10s end.
         if task_type in ('DT', 'ST', 'LongWalk'):
-            logger.debug(f"Timing: 150s (standard long walk)")
-            return {
-                "baseline_duration": 20.0,
-                "task_duration": 120.0,
-                "end_duration": 10.0,
-                "total_expected": 150.0
-            }
+            return {"baseline_duration": 20.0, "task_duration": 120.0, "end_duration": 10.0, "total_expected": 150.0}
 
-        # --- Event-dependent tasks: timing not used for baseline (events required) ---
-        # Return a reasonable default anyway
-        logger.debug(f"Timing: event-dependent task, default 150s")
-        return {
-            "baseline_duration": 20.0,
-            "task_duration": 120.0,
-            "end_duration": 10.0,
-            "total_expected": 150.0
-        }
+        # Event-dependent tasks don't actually use this for baseline timing
+        # (they require real events instead), but return something sane anyway.
+        return {"baseline_duration": 20.0, "task_duration": 120.0, "end_duration": 10.0, "total_expected": 150.0}
 
     def _process_pipeline_stages(self, data: pd.DataFrame,
                                  output_dir: str, file_basename: str,
                                  events: Optional[pd.DataFrame] = None,
                                  task_type: str = None,
-                                 subject: str = None,
-                                 global_ylim: Optional[Tuple[float, float]] = None) -> Optional[pd.DataFrame]:
-        """Process data through all pipeline stages with proper column handling for loader-renamed columns.
+                                 subject: str = None) -> Optional[pd.DataFrame]:
+        """Run one recording through every stage of the pipeline, handling the
+        column renaming the loader does along the way.
 
-        Pipeline order (matches FullCapProcessor): SQI (pre-TDDR) -> TDDR ->
-        OD-to-concentration (post-TDDR) -> SCR -> FIR -> baseline -> trim.
+        Order matches FullCapProcessor: SQI (pre-TDDR), then TDDR, then
+        OD-to-concentration (post-TDDR), then SCR, bandpass, baseline, trim.
         """
-        # ====== DIAGNOSTIC: Check input OD values ======
+        # The loader renames columns to CH{i}_WL{wavelength}, e.g. CH0_WL846, CH0_WL757.
         od_cols = [col for col in data.columns
-                   if any(kw in col for kw in ['WL', 'wavelength'])
-                   and pd.api.types.is_numeric_dtype(data[col])]
-
-        if od_cols:
-            logger.info(f" DIAGNOSTIC: Input OD values (first 5 rows):")
-            for col in od_cols[:2]:  # Show first 2 OD columns
-                sample_vals = data[col].iloc[:5].values
-                logger.info(f"   {col}: {sample_vals}")
-        # CRITICAL FIX: Properly identify OD columns after loader renaming
-        # Your loader renames columns to format: CH{i}_WL{wavelength}
-        od_cols = [col for col in data.columns
-                   if re.match(r'CH\d+_WL\d+', col)  # Matches CH0_WL846, CH0_WL757, etc.
+                   if re.match(r'CH\d+_WL\d+', col)
                    and pd.api.types.is_numeric_dtype(data[col])]
 
         if not od_cols:
-            logger.error(" No OD columns found with pattern CH*_WL*")
-            # Fallback: look for any columns with WL
+            logger.error("No OD columns found with pattern CH*_WL*")
             od_cols = [col for col in data.columns
-                       if 'WL' in col
-                       and pd.api.types.is_numeric_dtype(data[col])]
+                       if 'WL' in col and pd.api.types.is_numeric_dtype(data[col])]
 
         if not od_cols:
-            logger.error(" No OD columns found after fallback")
+            logger.error("No OD columns found after fallback")
             return None
 
-        logger.info(f"Found {len(od_cols)} OD columns: {od_cols}")
-
-        # DEBUG: Check OD values before conversion
-        logger.info("DEBUG: Checking OD values before concentration conversion")
-        for col in od_cols[:4]:  # Check first 4 columns
-            od_values = data[col].values
-            logger.info(f"   {col}: min={od_values.min():.6f}, max={od_values.max():.6f}, mean={od_values.mean():.6f}")
-
-        # Group channels by CH number (not by adjacent columns)
+        # Group by CH number rather than assuming wavelengths sit in adjacent columns.
         channel_groups = {}
-
-        # Extract unique channel numbers and group their wavelengths
         for col in od_cols:
             match = re.match(r'CH(\d+)_WL(\d+)', col)
             if match:
                 ch_num = match.group(1)
                 wavelength = match.group(2)
                 channel_id = f"CH{ch_num}"
+                channel_groups.setdefault(channel_id, {})[wavelength] = col
 
-                if channel_id not in channel_groups:
-                    channel_groups[channel_id] = {}
-
-                channel_groups[channel_id][wavelength] = col
-
-        logger.info(f"Created {len(channel_groups)} channel groups:")
-        for ch_id, wavelengths in channel_groups.items():
-            logger.info(f"   {ch_id}: {wavelengths}")
-
-        # Verify each channel has exactly 2 wavelengths
         valid_channels = {}
         for ch_id, wavelengths in channel_groups.items():
             if len(wavelengths) == 2:
                 valid_channels[ch_id] = wavelengths
-                logger.info(f" Valid channel {ch_id}: {list(wavelengths.keys())}nm")
             else:
-                logger.warning(f" Channel {ch_id} has {len(wavelengths)} wavelengths, expected 2")
+                logger.warning(f"Channel {ch_id} has {len(wavelengths)} wavelengths, expected 2")
 
         if not valid_channels:
-            logger.error(" No valid channels with 2 wavelengths found")
+            logger.error("No valid channels with 2 wavelengths found")
             return None
 
-        # ─────────────────────────────────────────────────────────────────────────
-        # PIPELINE ORDER (matches FullCapProcessor):
-        #   quality metrics -> TDDR -> OD-to-concentration -> SCR -> FIR -> baseline
-        #
-        # SQI is computed on the PRE-TDDR signal, because TDDR is a
-        # motion-correction step and SQI is designed to detect exactly the
-        # artifacts TDDR removes; evaluating post-TDDR would systematically
-        # inflate the score. The "raw" concentration plot is likewise
-        # pre-TDDR, since it's meant to show the minimally processed signal.
-        # TDDR is then applied to the OD, concentration is re-derived from the
-        # corrected OD, and that post-TDDR concentration feeds SCR / FIR /
-        # baseline / the final output.
-        # ─────────────────────────────────────────────────────────────────────────
+        # SQI runs on the pre-TDDR signal on purpose. TDDR is a motion
+        # correction step and SQI is meant to catch exactly the kind of
+        # artifacts TDDR removes, so scoring it after TDDR would just
+        # inflate the numbers. Same reasoning for the "raw" concentration
+        # plot - it's supposed to show the minimally processed signal.
+        # After this, TDDR gets applied to the OD, concentration gets
+        # re-derived from the corrected OD, and everything downstream (SCR,
+        # bandpass, baseline, final output) works off that post-TDDR version.
 
-        # 1) CONVERT OD TO CONCENTRATION (PRE-TDDR) — used for SQI + "raw" plot
-        logger.info("Converting pre-TDDR OD to concentration (for SQI + raw plotting)")
-        concentration_data_pre_tddr = self._convert_od_to_concentration(data, od_cols, valid_channels)
+        # 1) OD -> concentration, pre-TDDR, used for SQI and the raw plot.
+        # events/task_type get passed through here so baseline referencing
+        # can use the real S1->W1 (or S1->S2, or the L-Shape 2nd->3rd
+        # marker) window rather than just defaulting to "first N seconds".
+        concentration_data_pre_tddr = self._convert_od_to_concentration(
+            data, od_cols, valid_channels, events=events, task_type=task_type,
+        )
 
         if concentration_data_pre_tddr is None or concentration_data_pre_tddr.empty:
-            logger.error(" Failed to convert OD to concentration")
+            logger.error("Failed to convert OD to concentration")
             return None
 
-        logger.info(f" Converted to pre-TDDR concentration: {len(concentration_data_pre_tddr.columns)} columns")
-
-        # ─────────────────────────────────────────────────────────────────────────
-        # DIAGNOSTIC: Store data at each processing stage for comparison plots
-        # ─────────────────────────────────────────────────────────────────────────
         diagnostic_stages = {}
-
-        # Stage 1: Post-MBLL, pre-TDDR (raw concentration)
         diagnostic_stages["1_Post-MBLL"] = concentration_data_pre_tddr.copy()
 
-        # ─────────────────────────────────────────────────────────────────────────
-        # 1.5) PLOT "RAW" CONCENTRATION DATA (post-Beer-Lambert, pre-TDDR/SCR/filtering)
-        # This is the "minimally processed" data showing physiologically meaningful
-        # concentrations before signal processing removes noise/artifacts
-        # ─────────────────────────────────────────────────────────────────────────
+        # 1.5) Plot rawconcentration data: post-Beer-Lambert, before
+        # TDDR/SCR/filtering touch it - the least-processed view we have.
         self._plot_raw_concentration_data(
             data=data,
             concentration_data=concentration_data_pre_tddr,
             output_dir=output_dir,
             file_basename=file_basename,
             subject=subject,
-            global_ylim=global_ylim,
             condition=task_type,
             events=events
         )
 
-        # 2) Calculate quality (any combination of SQI/SCI/PSP per enabled_metrics)
-        #    using the PRE-TDDR OD and PRE-TDDR concentration data.
+        # 2) Quality scoring (whichever of SQI/SCI/PSP are enabled), on the
+        #    pre-TDDR OD and pre-TDDR concentration.
         excluded_channels, quality_report = self._calculate_quality_and_filter(
             data, valid_channels, output_dir, file_basename, concentration_data_pre_tddr
         )
         self._last_quality_report = quality_report
 
-        # 3) APPLY TDDR to the OD signals, then re-derive concentration from the
-        #    corrected OD.
-        logger.info("Applying TDDR motion correction to OD signals")
+        # 3) TDDR on the OD signals, then re-derive concentration from the
+        #    corrected OD using the same events/task_type as above.
         data_tddr = self._apply_tddr(data)
 
-        logger.info("Re-converting TDDR-corrected OD to concentration")
-        concentration_data = self._convert_od_to_concentration(data_tddr, od_cols, valid_channels)
+        concentration_data = self._convert_od_to_concentration(
+            data_tddr, od_cols, valid_channels, events=events, task_type=task_type,
+        )
 
         if concentration_data is None or concentration_data.empty:
-            logger.error(" Failed to convert TDDR-corrected OD to concentration")
+            logger.error("Failed to convert TDDR-corrected OD to concentration")
             return None
 
-        logger.info(f" Converted post-TDDR concentration: {len(concentration_data.columns)} columns")
-
-        # Stage 2: Post-TDDR concentration
         diagnostic_stages["2_Post-TDDR"] = concentration_data.copy()
 
-        # 4) Build working dataframe - START FRESH with only metadata + concentration
-        logger.info(" Building working dataframe with ONLY concentration data")
-
-        # CRITICAL: Start with ONLY metadata columns, NO OD columns
+        # 4) Start a fresh working frame with just metadata + concentration.
         metadata_cols = []
         if 'Sample number' in data.columns:
             metadata_cols.append('Sample number')
@@ -500,25 +431,15 @@ class FileProcessor:
             metadata_cols.append('Event')
 
         working_data = data[metadata_cols].copy()
-        logger.info(f"Started with {len(metadata_cols)} metadata columns: {metadata_cols}")
-
         for col in concentration_data.columns:
             working_data[col] = concentration_data[col]
 
-        logger.info(f"Added {len(concentration_data.columns)} concentration columns")
-        logger.info(f"Working data now has {len(working_data.columns)} total columns")
-
-        # 5) Apply quality filtering if enabled (exclusions were computed pre-TDDR,
-        #    using whichever of SQI/SCI/PSP are in self.enabled_metrics)
+        # 5) Drop excluded channels if filtering is on. The exclusion list
+        #    was computed pre-TDDR from whichever metrics are enabled.
         if self.enable_quality_filtering and excluded_channels:
-            logger.info(f" Quality filtering enabled: Excluding {len(excluded_channels)} channels")
-
-            # Determine which concentration columns to exclude based on OD channel exclusions
             concentration_cols_to_exclude = []
             for excluded_od_col in excluded_channels:
-                # Find corresponding concentration columns
                 for conc_col in working_data.columns:
-                    # Match channel pattern (e.g., CH0 corresponds to CH0_HbO and CH0_HbR)
                     channel_match = re.search(r'CH\d+', excluded_od_col)
                     if channel_match and channel_match.group() in conc_col:
                         concentration_cols_to_exclude.append(conc_col)
@@ -526,117 +447,83 @@ class FileProcessor:
             if concentration_cols_to_exclude:
                 concentration_cols_to_exclude = list(set(concentration_cols_to_exclude))
                 working_data = working_data.drop(columns=concentration_cols_to_exclude)
-                logger.info(f"Excluded {len(concentration_cols_to_exclude)} concentration columns based on quality metrics")
-        else:
-            logger.info(f" Quality filtering disabled or nothing to exclude: Using all {len(concentration_data.columns)} concentration channels")
 
-        # Get concentration signal columns for further processing
         signal_cols = [col for col in working_data.columns
                        if any(kw in col for kw in ['HbO', 'HbR', 'O2Hb', 'HHb'])
                        and pd.api.types.is_numeric_dtype(working_data[col])]
 
         if not signal_cols:
-            logger.error(" No concentration signal columns found after SQI filtering")
+            logger.error("No concentration signal columns found after quality filtering")
             return None
 
-        logger.info(f"Processing {len(signal_cols)} concentration channels")
-
-        # Verify values are in reasonable range
+        # Quick sanity check on magnitude - if OD ended up here instead of
+        # concentration, values would come out two or three orders too big.
         sample_mean = working_data[signal_cols].iloc[:10].mean().mean()
-        logger.info(f" Sample concentration mean (first 10 rows): {sample_mean:.6f} µM")
-
         if abs(sample_mean) > 50:
-            logger.error(f" ERROR: Concentration values are too large: {sample_mean:.6f} µM")
-            logger.error(f"   Expected: -10 to +10 µM typically")
-            logger.error(f"   This indicates OD data is being used instead of concentration!")
-
-            logger.error(f"   Working data columns: {list(working_data.columns)}")
-
-            # Check if any OD columns snuck in
-            od_columns_present = [col for col in working_data.columns if 'WL' in col]
-            if od_columns_present:
-                logger.error(f"    FOUND OD COLUMNS IN WORKING DATA: {od_columns_present}")
-                logger.error(f"   These should NOT be here!")
+            logger.error(
+                f"Concentration values are too large ({sample_mean:.6f} uM, expected -10 to +10 "
+                f"typically), which suggests OD data is being used instead of concentration."
+            )
 
         signal_slice = working_data[signal_cols].copy()
 
-        # ─── CONCENTRATION PROCESSING PIPELINE ──────────────────────────────────
-
-        # 6) SCR (on post-TDDR concentration data)
-        scr_data = self._apply_scr(signal_slice)
-
-        # Stage 3: Post-SCR
+        # 6) SCR on the post-TDDR concentration data.
+        scr_data = self._apply_scr(signal_slice, quality_report)
         diagnostic_stages["3_Post-SCR"] = scr_data.copy()
 
-        # 7) FIR FILTERING (on concentration data)
-        logger.info("Applying FIR bandpass filter to concentration data (0.01-0.1 Hz)")
-        fir_filtered_data = self._apply_fir_filter(scr_data)
+        # 7) Bandpass filter the concentration data.
+        filtered_data = self._apply_bandpass_filter(scr_data)
+        diagnostic_stages["4_Post-Filter"] = filtered_data.copy()
 
-        # Stage 4: Post-Filter
-        diagnostic_stages["4_Post-Filter"] = fir_filtered_data.copy()
+        for col in filtered_data.columns:
+            working_data[col] = filtered_data[col]
 
-        # Replace ONLY the concentration columns in working_data with filtered versions
-        for col in fir_filtered_data.columns:
-            working_data[col] = fir_filtered_data[col]
-
-        logger.info(f"Applied filtering to {len(fir_filtered_data.columns)} concentration channels")
-
-        # 8) Baseline Correction
+        # 8) Baseline correction.
         baseline_corrected = self._apply_baseline_correction(working_data, events, task_type)
 
         if baseline_corrected is not None:
-            # Stage 5: Post-Baseline
-            # Extract just the signal columns for the diagnostic
             bc_signal_cols = [col for col in baseline_corrected.columns
                               if any(kw in col for kw in ['HbO', 'HbR', 'O2Hb', 'HHb'])
                               and pd.api.types.is_numeric_dtype(baseline_corrected[col])]
             if bc_signal_cols:
                 diagnostic_stages["5_Post-Baseline"] = baseline_corrected[bc_signal_cols].copy()
 
-            # ─────────────────────────────────────────────────────────────────────
-            # CREATE DIAGNOSTIC PLOTS FOR EACH STAGE
-            # ─────────────────────────────────────────────────────────────────────
-            logger.info(" Creating diagnostic plots for each processing stage...")
-            for stage_name, stage_data in diagnostic_stages.items():
-                stage_num = int(stage_name.split('_')[0])
-                stage_label = stage_name.split('_', 1)[1]
-                self._plot_diagnostic_stage(
-                    data=stage_data,
+            if not self.skip_diagnostic_plots:
+                for stage_name, stage_data in diagnostic_stages.items():
+                    stage_num = int(stage_name.split('_')[0])
+                    stage_label = stage_name.split('_', 1)[1]
+                    self._plot_diagnostic_stage(
+                        data=stage_data,
+                        output_dir=output_dir,
+                        file_basename=file_basename,
+                        subject=subject,
+                        condition=task_type,
+                        stage_name=stage_label,
+                        stage_number=stage_num,
+                        events=events
+                    )
+
+                self._create_diagnostic_summary_plot(
+                    stages_data=diagnostic_stages,
                     output_dir=output_dir,
                     file_basename=file_basename,
                     subject=subject,
                     condition=task_type,
-                    stage_name=stage_label,
-                    stage_number=stage_num,
                     events=events
                 )
 
-            # Create summary plot with all stages
-            self._create_diagnostic_summary_plot(
-                stages_data=diagnostic_stages,
-                output_dir=output_dir,
-                file_basename=file_basename,
-                subject=subject,
-                condition=task_type,
-                events=events
-            )
-
-            # 9) Apply post-event trimming
+            # 9) Post-event trimming.
             trimmed_data = self._apply_post_event_trimming(baseline_corrected, events, task_type)
 
-            # Final verification
             final_signal_cols = [col for col in trimmed_data.columns
                                  if any(kw in col for kw in ['HbO', 'HbR'])
                                  and pd.api.types.is_numeric_dtype(trimmed_data[col])]
 
             if final_signal_cols:
                 final_mean = trimmed_data[final_signal_cols].mean().mean()
-                logger.info(f" Final processed data mean: {final_mean:.6f} µM")
-
                 if abs(final_mean) > 50:
-                    logger.error(f" WARNING: Final values still too large: {final_mean:.6f} µM")
+                    logger.error(f"Final values still too large: {final_mean:.6f} uM")
 
-            # Return the fully processed CONCENTRATION data
             return trimmed_data
 
         return None
@@ -646,26 +533,16 @@ class FileProcessor:
                                      output_dir: str,
                                      file_basename: str,
                                      subject: str,
-                                     global_ylim: Optional[Tuple[float, float]],
                                      condition: str,
                                      events: Optional[pd.DataFrame] = None) -> None:
         """
-        Plot "raw" concentration data - post-Beer-Lambert conversion, pre-TDDR/SCR/filtering.
+        Plot the "raw" concentration data - right after the Beer-Lambert
+        conversion, before TDDR/SCR/filtering touch anything.
 
-
-        Note: Short channels (CH3, CH5) are excluded from averaging to match final output.
-
-        Args:
-            data: Original data with metadata columns (Sample number, Time, Event)
-            concentration_data: DataFrame with HbO/HbR concentration columns
-            output_dir: Directory for saving plots
-            file_basename: Base filename for plot naming
-            subject: Subject identifier
-            global_ylim: Optional y-axis limits for consistent scaling
-            condition: Task type/condition label
-            events: Optional event markers DataFrame
+        Short channels left out of the averaging so
+        matches how the final output is built. Y-limits are derived from
+        each plot's own data rather than kept consistent across recordings.
         """
-        # Find HbO and HbR columns, exclude short channels
         o2hb_cols = self._get_long_channel_cols(concentration_data.columns, 'oxy')
         hhb_cols = self._get_long_channel_cols(concentration_data.columns, 'deoxy')
         combined_cols = o2hb_cols + hhb_cols
@@ -674,23 +551,16 @@ class FileProcessor:
             logger.warning("No long-channel concentration columns found for raw plotting")
             return
 
-        logger.info(
-            f" Raw concentration plot using {len(o2hb_cols)} HbO and {len(hhb_cols)} HbR long channels (excluding CH3, CH5)")
-
-        # Create condition-specific output directory
         condition_dir = os.path.join(output_dir, condition)
         os.makedirs(condition_dir, exist_ok=True)
 
-        # Build a combined df for plotting
         plot_df = concentration_data[combined_cols].copy()
 
-        # aDdd time information
         if 'Time (s)' in data.columns:
             plot_df['Time (s)'] = data['Time (s)'].values
         else:
             plot_df['Time (s)'] = np.arange(len(plot_df)) / self.fs
 
-        # ─── Plot 1: Individual channels (long channels only) ───
         try:
             fig, axes, ylim = plot_channels_separately(
                 plot_df[combined_cols],
@@ -698,15 +568,13 @@ class FileProcessor:
                 title=f"{file_basename} - Raw Concentration (Post-MBLL, Pre-Processing)",
                 subject=subject,
                 condition=condition,
-                y_lim=global_ylim
+                y_lim=None
             )
             self._save_figure(fig,
                               os.path.join(condition_dir, f"raw_concentration_individual_channels_{condition}.png"))
-            logger.info(f"Saved raw concentration individual channels plot")
         except Exception as e:
             logger.warning(f"Failed to create individual channels plot: {e}")
 
-        # ─── Plot 2: Overall averaged signals with events ───
         if o2hb_cols and hhb_cols:
             try:
                 avg_o2hb = plot_df[o2hb_cols].mean(axis=1)
@@ -718,7 +586,6 @@ class FileProcessor:
                     "grand deoxy": avg_hhb
                 })
 
-                # Clean events for plotting
                 clean_events = None
                 if events is not None and not events.empty:
                     valid = events[
@@ -737,16 +604,10 @@ class FileProcessor:
                     title=f"{file_basename} - Raw Concentration Overall (Post-MBLL, Pre-Processing)",
                     subject=subject,
                     condition=condition,
-                    y_lim=global_ylim,
+                    y_lim=None,
                     events=clean_events
                 )
                 self._save_figure(fig, os.path.join(condition_dir, f"raw_concentration_overall_{condition}.png"))
-                logger.info(f"Saved raw concentration overall plot")
-
-                # Log some statistics about the raw concentration data
-                logger.info(f"Raw concentration statistics (long channels only):")
-                logger.info(f"   HbO mean: {avg_o2hb.mean():.4f} µM, std: {avg_o2hb.std():.4f} µM")
-                logger.info(f"   HbR mean: {avg_hhb.mean():.4f} µM, std: {avg_hhb.std():.4f} µM")
 
             except Exception as e:
                 logger.warning(f"Failed to create overall signals plot: {e}")
@@ -760,21 +621,10 @@ class FileProcessor:
                                stage_number: int,
                                events: Optional[pd.DataFrame] = None) -> None:
         """
-        Plot data at a specific processing stage for diagnostic purposes.
-
-        Note: Short channels (CH3, CH5) are excluded from averaging to match final output.
-
-        Args:
-            data: DataFrame with HbO/HbR concentration columns
-            output_dir: Directory for saving plots
-            file_basename: Base filename for plot naming
-            subject: Subject identifier
-            condition: Task type/condition label
-            stage_name: e.g., "Post-SCR"
-            stage_number: Numeric stage identifier for ordering (1, 2, 3, etc.)
-            events: Optional event markers DataFrame
+        One diagnostic plot for a single stage of the pipeline (e.g.
+        "Post-SCR"). Short channels stay out of the averaging here too, for
+        consistency with the final output.
         """
-        # Find HbO and HbR columns, EXCLUDING short channels
         o2hb_cols = self._get_long_channel_cols(data.columns, 'oxy')
         hhb_cols = self._get_long_channel_cols(data.columns, 'deoxy')
 
@@ -782,12 +632,10 @@ class FileProcessor:
             logger.warning(f"No long-channel concentration columns found for diagnostic plot at stage: {stage_name}")
             return
 
-        # Create diagnostic output directory
         diag_dir = os.path.join(output_dir, condition, "diagnostic_stages")
         os.makedirs(diag_dir, exist_ok=True)
 
         try:
-            # Calculate averages (long channels only)
             avg_o2hb = data[o2hb_cols].mean(axis=1)
             avg_hhb = data[hhb_cols].mean(axis=1)
 
@@ -797,7 +645,6 @@ class FileProcessor:
                 "grand deoxy": avg_hhb
             })
 
-            # Clean events for plotting
             clean_events = None
             if events is not None and not events.empty:
                 valid = events[
@@ -824,12 +671,6 @@ class FileProcessor:
                                        f"stage_{stage_number}_{stage_name.replace(' ', '_').replace('-', '_')}_{condition}.png")
             self._save_figure(fig, output_path)
 
-            # Log statistics for this stage
-            logger.info(f" Stage {stage_number} ({stage_name}) statistics (long channels only):")
-            logger.info(f"   HbO mean: {avg_o2hb.mean():.4f} µM, std: {avg_o2hb.std():.4f} µM")
-            logger.info(f"   HbR mean: {avg_hhb.mean():.4f} µM, std: {avg_hhb.std():.4f} µM")
-            logger.info(f"   Saved to: {output_path}")
-
         except Exception as e:
             logger.warning(f"Failed to create diagnostic plot for stage {stage_name}: {e}")
 
@@ -840,23 +681,13 @@ class FileProcessor:
                                         condition: str,
                                         events: Optional[pd.DataFrame] = None) -> None:
         """
-        Create a multi-panel summary plot showing all processing stages side by side.
-
-        Note: Short channels (CH3, CH5) are excluded from averaging to match final output.
-
-        Args:
-            stages_data: Dict mapping stage names to DataFrames
-            output_dir: Directory for saving plots
-            file_basename: Base filename for plot naming
-            subject: Subject identifier
-            condition: Task type/condition label
-            events: Optional event markers DataFrame
+        One multi-panel figure with every processing stage stacked so they
+        can be compared side by side. Short channels are excluded here too.
         """
         n_stages = len(stages_data)
         if n_stages == 0:
             return
 
-        # Create diagnostic output directory
         diag_dir = os.path.join(output_dir, condition, "diagnostic_stages")
         os.makedirs(diag_dir, exist_ok=True)
 
@@ -868,10 +699,8 @@ class FileProcessor:
             f"{file_basename} - Processing Pipeline Stages\nSubject: {subject}\n(Long channels only, excluding CH3 & CH5)",
             fontsize=12)
 
-        # Clean events once
         clean_events = None
         if events is not None and not events.empty:
-            # Get max length from any stage
             max_len = max(len(df) for df in stages_data.values())
             valid = events[
                 events['Sample number'].notna() &
@@ -886,7 +715,6 @@ class FileProcessor:
         for idx, (stage_name, data) in enumerate(stages_data.items()):
             ax = axes[idx]
 
-            # Find concentration columns, EXCLUDING short channels
             o2hb_cols = self._get_long_channel_cols(data.columns, 'oxy')
             hhb_cols = self._get_long_channel_cols(data.columns, 'deoxy')
 
@@ -895,16 +723,13 @@ class FileProcessor:
                 ax.set_title(stage_name)
                 continue
 
-            # Calculate averages (long channels only)
             avg_o2hb = data[o2hb_cols].mean(axis=1)
             avg_hhb = data[hhb_cols].mean(axis=1)
             time = np.arange(len(data)) / self.fs
 
-            # Plot signals
             ax.plot(time, avg_o2hb, 'r-', label='HbO', linewidth=1.2)
             ax.plot(time, avg_hhb, 'b-', label='HbR', linewidth=1.2)
 
-            # Add events
             if clean_events is not None:
                 ylim = ax.get_ylim()
                 for _, row in clean_events.iterrows():
@@ -914,10 +739,9 @@ class FileProcessor:
                         ax.text(event_time, ylim[1] * 0.95, str(row['Event']),
                                 rotation=90, va='top', ha='right', fontsize=7, alpha=0.8)
 
-            # Formatting
             ax.set_title(
-                f"{stage_name} (HbO: {avg_o2hb.mean():.2f}±{avg_o2hb.std():.2f}, HbR: {avg_hhb.mean():.2f}±{avg_hhb.std():.2f} µM)")
-            ax.set_ylabel("Δ[Hb] (µM)")
+                f"{stage_name} (HbO: {avg_o2hb.mean():.2f}+/-{avg_o2hb.std():.2f}, HbR: {avg_hhb.mean():.2f}+/-{avg_hhb.std():.2f} uM)")
+            ax.set_ylabel("Delta[Hb] (uM)")
             ax.legend(loc='upper right', fontsize=8)
 
         axes[-1].set_xlabel("Time (s)")
@@ -926,52 +750,66 @@ class FileProcessor:
 
         output_path = os.path.join(diag_dir, f"SUMMARY_all_stages_{condition}.png")
         self._save_figure(fig, output_path)
-        logger.info(f" Saved diagnostic summary plot to: {output_path}")
 
-    def _apply_fir_filter(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Apply FIR filter to the data with appropriate parameters."""
+    def _apply_bandpass_filter(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Apply the zero-phase Butterworth bandpass to concentration data."""
         try:
-            logger.info("Applying FIR bandpass filter: 0.01-0.1 Hz, order=1000")
-            return fir_filter(data, order=1000, Wn=[0.01, 0.1], fs=int(self.fs))
+            return butterworth_bandpass(data, order=4, Wn=[0.01, 0.1], fs=int(self.fs))
         except Exception as e:
-            logger.warning(f"FIR filtering failed: {str(e)}")
+            logger.warning(f"Bandpass filtering failed: {str(e)}")
             return data
 
     def _apply_post_event_trimming(self, data: pd.DataFrame, events: pd.DataFrame,
                                    task_type: str) -> pd.DataFrame:
         """
-        Apply trimming after walking/task start event for quality control.
-        IMPROVED: Better preservation of critical start events.
+        Trim the data down to the mobility-task window: cut a bit after the
+        walking/task-start event, and for long_walk tasks also cut the
+        trailing rest period at the end, so what's left is just the walking
+        portion between the two rest blocks.
         """
-        self._event_index_remap = None  # reset per file
+        self._event_index_remap = None  # reset for each new file
 
         if self.post_walking_trim_seconds <= 0:
             return data
 
         if events is None or events.empty:
-            logger.warning(" No events available for post-event trimming")
-            return data
+            logger.warning("No events available for post-event trimming; using synthetic "
+                           "fallback boundaries (counting backward from the end of the recording)")
+            return self._fallback_post_event_trimming(data, task_type)
 
-        walking_start_sample = self._find_walking_start_event(events, task_type)
+        # When W1 (or something like it) is missing but have real S1
+        # and S2 markers, figure out what S2 actually means from the S1->S2
+        # gap before falling back to _find_walking_start_event's simpler
+        # "just take the second S-marker" logic - that fallback has no way
+        # to tell a task-end S2 from a walking-start one.
+        forced_task_end_sample = None
+        resolved = self._resolve_long_walk_boundaries(events, task_type, len(data))
+        if resolved is not None:
+            _, walking_start_sample, forced_task_end_sample, description = resolved
+        else:
+            walking_start_sample = self._find_walking_start_event(events, task_type)
         if walking_start_sample is None:
-            logger.warning(f" No walking start event found for {task_type}, skipping post-event trimming")
-            return data
+            logger.warning(f"No walking start event found for {task_type}; using synthetic "
+                           f"fallback boundaries (counting backward from the end of the recording)")
+            return self._fallback_post_event_trimming(data, task_type)
 
         trim_samples = int(self.post_walking_trim_seconds * self.fs)
         trim_start_sample = walking_start_sample + trim_samples
 
         if trim_start_sample >= len(data):
-            logger.warning(" Post-event trim would remove all data after walking start, skipping")
-            return data
+            logger.warning(f"Walking-start detection returned sample {walking_start_sample}, which "
+                           f"leaves nothing to keep after the {self.post_walking_trim_seconds}s trim "
+                           f"(recording is only {len(data)} samples). This usually means "
+                           f"_find_walking_start_event's own internal fallback picked an event that "
+                           f"isn't a real walking-start marker. Using synthetic fallback boundaries instead.")
+            return self._fallback_post_event_trimming(data, task_type)
 
-        # IMPROVED: Check if any critical events fall in the trim region
         critical_event_names = self.task_walking_events.get(task_type, [])
         critical_event_names_upper = [e.upper() for e in critical_event_names]
 
         events_clean = events.copy()
         events_clean['Event_Upper'] = events_clean['Event'].astype(str).str.upper()
 
-        # Find any critical events in the trim region
         events_in_trim_region = events_clean[
             (events_clean['Sample number'] >= walking_start_sample) &
             (events_clean['Sample number'] < trim_start_sample) &
@@ -979,63 +817,276 @@ class FileProcessor:
             ]
 
         if not events_in_trim_region.empty:
-            logger.warning(f" Found {len(events_in_trim_region)} critical events in trim region:")
-            for _, evt in events_in_trim_region.iterrows():
-                logger.warning(f"   - {evt['Event']} at sample {evt['Sample number']}")
-            logger.warning(f"   Adjusting trim to preserve these events")
+            logger.warning(f"Found {len(events_in_trim_region)} critical events in trim region; "
+                           f"adjusting trim to preserve them")
 
-            # Adjust trim to start after the last critical event in the region
             last_critical_sample = events_in_trim_region['Sample number'].max()
             trim_start_sample = int(last_critical_sample) + 1
 
-            logger.info(f"   Adjusted trim start to sample {trim_start_sample}")
+        # This next bit handles the trailing rest period at the end of the
+        # recording (the "end_duration" from _get_task_timing - typically
+        # 10s of standing still once the mobility task is done). It only
+        # gets trimmed for long_walk tasks (DT/ST/LongWalk, plus the 90s
+        # Turn_DT/Turn_ST variants) because those have a fixed task_duration
+        # by protocol design - I've checked this against real event data and
+        # the W1->S2 gap lines up with task_duration almost exactly.
+        # Event-dependent tasks (fTurn/LShape/Obstacle/Navigation) end
+        # whenever the participant finishes, not on a schedule, so their
+        # durations from _get_task_timing aren't reliable enough to trim
+        # against - those recordings only get trimmed at the start, as before.
+        task_config = self.task_types.get(task_type, {})
+        task_end_sample = len(data)
+        if forced_task_end_sample is not None:
+            # _resolve_long_walk_boundaries already found a real S2 marker
+            # for the task-end position, so use it directly - an actual
+            # recorded marker beats a duration-based guess.
+            if forced_task_end_sample > trim_start_sample:
+                task_end_sample = min(forced_task_end_sample, len(data))
+            else:
+                logger.warning("Resolved task-end sample is not after trim_start_sample; "
+                               "keeping data through the end of the recording instead.")
+        elif task_config.get('type') == 'long_walk':
+            timing = self._get_task_timing(getattr(self, "_current_file_basename", ""), task_type)
+            task_duration_samples = int(timing['task_duration'] * self.fs)
+            candidate_end = walking_start_sample + task_duration_samples
+            if candidate_end > trim_start_sample:
+                task_end_sample = min(candidate_end, len(data))
+            else:
+                logger.warning("Computed task-end sample is not after trim_start_sample; "
+                               "keeping data through the end of the recording instead.")
 
-        if walking_start_sample > 0:
-            # Keep baseline up to walking_start, then drop [walking_start, trim_start) and keep the rest
-            baseline_data = data.iloc[:walking_start_sample].copy()
-            walking_data = data.iloc[trim_start_sample:].copy()
-            trimmed_data = pd.concat([baseline_data, walking_data], ignore_index=True)
+        # The pre-walking baseline already did its job - _apply_baseline_correction
+        # used it as the reference window before this method ever runs, so it
+        # doesn't belong in the final dataset. Leaving it in would mix baseline
+        # samples into the task period, and anything downstream computing stats
+        # over the result (stats_collector's "Overall Mean", for instance) would
+        # end up diluting the actual walking response. Same reasoning applies to
+        # the trailing rest period wherever we can pin it down.
+        trimmed_data = data.iloc[trim_start_sample:task_end_sample].copy()
 
-            baseline_len = len(baseline_data)
+        def _remap(old_idx: int) -> Optional[int]:
+            if old_idx < trim_start_sample or old_idx >= task_end_sample:
+                return None
+            return old_idx - trim_start_sample
 
-            def _remap(old_idx: int) -> Optional[int]:
-                if old_idx < walking_start_sample:
-                    return old_idx
-                if old_idx < trim_start_sample:
-                    return None  # fell inside removed gap
-                return baseline_len + (old_idx - trim_start_sample)
+        self._event_index_remap = _remap
 
-            self._event_index_remap = _remap
-        else:
-            # Walking starts at the beginning; drop first trim_samples
-            trimmed_data = data.iloc[trim_samples:].copy()
-
-            def _remap(old_idx: int) -> Optional[int]:
-                return (old_idx - trim_samples) if old_idx >= trim_samples else None
-
-            self._event_index_remap = _remap
-
-        # Reset sample numbers/time
         trimmed_data['Sample number'] = np.arange(len(trimmed_data))
         if 'Time (s)' in trimmed_data.columns:
             trimmed_data['Time (s)'] = trimmed_data['Sample number'] / self.fs
 
-        removed = len(data) - len(trimmed_data)
-        logger.info(f"Applied post-walking trimming: removed {removed} samples (~{removed / self.fs:.1f}s)")
+        return trimmed_data
 
+    def _fallback_post_event_trimming(self, data: pd.DataFrame, task_type: str) -> pd.DataFrame:
+        """Falls back to a synthetic start/end trim when there's no usable
+        walking-start event - either no events at all, or none that match a
+        known walking-start pattern. Same approach as
+        _fallback_baseline_correction: count backward from the recording's
+        actual length instead of assuming a fixed absolute start time,
+        since the length is the one thing we can always trust.
+
+        This only ever gets called for long_walk tasks. Event-dependent
+        tasks need a minimum number of events per _validate_task_requirements
+        and get rejected earlier if they don't have it, so we never end up
+        guessing a walking-start position for those.
+        """
+        total = len(data)
+        file_basename = getattr(self, "_current_file_basename", "")
+        timing = self._get_task_timing(file_basename, task_type or "Unknown")
+        total_expected = timing["total_expected"]
+        baseline_duration = timing["baseline_duration"]
+        end_duration = timing["end_duration"]
+
+        min_required = int(total_expected * self.fs)
+        if total < min_required:
+            logger.warning(f"Fallback trim: record too short ({total} samples < {min_required} "
+                           f"expected); skipping trim entirely (keeping the full recording).")
+            return data
+
+        # Synthetic walking-start = (total_expected - baseline_duration)
+        # seconds before the end of the recording, same as
+        # _fallback_baseline_correction's s2.
+        walking_start_sample = int(total - (total_expected - baseline_duration) * self.fs)
+        trim_samples = int(self.post_walking_trim_seconds * self.fs)
+        trim_start_sample = max(0, walking_start_sample + trim_samples)
+
+        # Synthetic task-end = end_duration seconds before the end of the
+        # recording (mirrors _fallback_baseline_correction's s3) - this is
+        # what keeps the trailing standing-still period out even when there's
+        # no real event marking where it begins.
+        task_config = self.task_types.get(task_type, {})
+        task_end_sample = total
+        if task_config.get("type") == "long_walk":
+            task_end_sample = max(trim_start_sample, int(total - end_duration * self.fs))
+
+        if trim_start_sample >= task_end_sample:
+            logger.warning("Fallback trim: computed boundaries left nothing to keep; "
+                           "skipping trim entirely (keeping the full recording).")
+            return data
+
+        trimmed_data = data.iloc[trim_start_sample:task_end_sample].copy()
+
+        def _remap(old_idx: int) -> Optional[int]:
+            if old_idx < trim_start_sample or old_idx >= task_end_sample:
+                return None
+            return old_idx - trim_start_sample
+
+        self._event_index_remap = _remap
+
+        trimmed_data["Sample number"] = np.arange(len(trimmed_data))
+        if "Time (s)" in trimmed_data.columns:
+            trimmed_data["Time (s)"] = trimmed_data["Sample number"] / self.fs
+
+        removed = total - len(trimmed_data)
+        logger.warning(
+            f"Used synthetic fallback trim (backward from end of recording, "
+            f"total_expected={total_expected}s): kept samples {trim_start_sample}-{task_end_sample}, "
+            f"removed {removed} samples (~{removed / self.fs:.1f}s) including baseline"
+            f"{' and the trailing end-of-recording rest' if task_end_sample < total else ''}."
+        )
         return trimmed_data
 
     def _apply_z_transformation(self, data: pd.DataFrame, signal_cols: List[str]) -> pd.DataFrame:
         """Apply Z-transformation using the dedicated module."""
         return z_transformation(data, signal_cols)
 
+    def _resolve_long_walk_boundaries(
+        self, events: pd.DataFrame, task_type: str, n_samples: int,
+    ) -> Optional[Tuple[int, int, Optional[int], str]]:
+        """Work out baseline-start, walking-start, and (where possible)
+        task-end for a long_walk task, but treat every marker's label as a
+        hint rather than gospel - it gets checked against the expected
+        timing before we trust it. This still runs even when there's a
+        marker explicitly labeled as walking-start (W1/WALK/etc), because a
+        marker that's present but simply mislabeled - say, sitting where
+        baseline-start should really be - would otherwise sail through with
+        zero verification.
+
+        The rule of thumb: a real recorded marker wins over a computed
+        estimate as long as its position is plausible, meaning within about
+        50% of the expected protocol duration. So markers keep their actual
+        recorded positions in the common case, and only get overridden by an
+        inferred value when they clearly don't fit the rest of the file's
+        timing.
+
+        The two things we can lean on: S1 when it's there (the most direct
+        anchor for baseline-start), and the recording's own length minus
+        end_duration (an anchor for task-end, since the file's length is
+        always known - same assumption _fallback_post_event_trimming makes).
+        From those, walking-start is expected around S1 + baseline_duration
+        (or, without S1, worked backward from a task-end anchor instead),
+        and if a real W1-type or S2 marker sits near that expected spot, we
+        use it directly rather than the pure calculation. Task-end works the
+        same way - a real S2 only counts if it lines up with
+        walking_start + task_duration. baseline_start is just S1 when we
+        have it, since nothing more reliable exists to check it against and
+        it's already the anchor for everything else here; without S1, it's
+        computed as walking_start - baseline_duration so this stays
+        consistent with what _apply_post_event_trimming would compute too.
+
+        Returns (baseline_start_sample, walking_start_sample,
+        task_end_sample_or_None, description). Returns None if there's
+        nothing to go on at all - no S1, no W1-type marker, no S2 - in
+        which case the caller falls back to its own synthetic approach.
+        """
+        task_config = self.task_types.get(task_type, {})
+        if task_config.get('type') != 'long_walk':
+            return None
+
+        events_clean = events.copy()
+        events_clean['Event_Upper'] = events_clean['Event'].astype(str).str.strip().str.upper()
+        events_clean['Sample number'] = pd.to_numeric(events_clean['Sample number'], errors='coerce')
+        events_clean = events_clean.dropna(subset=['Sample number']).sort_values('Sample number')
+
+        def _first(label: str) -> Optional[int]:
+            m = events_clean[events_clean['Event_Upper'] == label]
+            return int(m.iloc[0]['Sample number']) if not m.empty else None
+
+        s1_sample = _first('S1')
+        s2_sample = _first('S2')
+        walking_labels = {e.upper() for e in self.task_walking_events.get(task_type, [])}
+        w_matches = events_clean[events_clean['Event_Upper'].isin(walking_labels)]
+        w1_sample = int(w_matches.iloc[0]['Sample number']) if not w_matches.empty else None
+
+        if s1_sample is None and w1_sample is None and s2_sample is None:
+            return None  # nothing to reason from at all
+
+        file_basename = getattr(self, "_current_file_basename", "")
+        timing = self._get_task_timing(file_basename, task_type)
+        baseline_duration = timing['baseline_duration']
+        task_duration = timing['task_duration']
+        end_duration = timing['end_duration']
+        anchor_task_end = n_samples - int(end_duration * self.fs)
+
+        def _close(a: Optional[int], b: Optional[int], ref_duration: float) -> bool:
+            """True if a and b land within 50% of ref_duration seconds of
+            each other - close enough to be normal timing jitter rather than
+            a mislabeled or unrelated marker."""
+            if a is None or b is None:
+                return False
+            return abs(a - b) / self.fs <= 0.5 * max(ref_duration, 1.0)
+
+        # Start with a pure timing estimate, before tying it to any specific marker.
+        if s1_sample is not None:
+            inferred_walking_start = s1_sample + int(baseline_duration * self.fs)
+        elif s2_sample is not None:
+            inferred_walking_start = s2_sample - int(task_duration * self.fs)
+        elif w1_sample is not None:
+            inferred_walking_start = w1_sample
+        else:
+            inferred_walking_start = anchor_task_end - int(task_duration * self.fs)
+
+        # If a real marker actually fits, use it instead of the pure estimate -
+        # a recorded timestamp beats an assumption whenever the two roughly agree.
+        walking_start_sample = inferred_walking_start
+        walking_start_source = f"inferred position {inferred_walking_start} (no marker close enough to trust)"
+        for label, sample in (("W1/WALK-type marker", w1_sample), ("S2", s2_sample)):
+            if sample is not None and _close(sample, inferred_walking_start, baseline_duration):
+                walking_start_sample = sample
+                walking_start_source = f"{label} at sample {sample} (matches expected walking-start timing)"
+                break
+
+        if w1_sample is not None and w1_sample != walking_start_sample:
+            gap_from_s1 = "n/a (no S1)" if s1_sample is None else f"{(w1_sample - s1_sample) / self.fs:.1f}s"
+            logger.warning(
+                f"Walking-start marker (W1/WALK/etc) at sample {w1_sample} rejected as "
+                f"implausible (S1->marker gap={gap_from_s1}, expected ~{baseline_duration}s); "
+                f"using {walking_start_source} instead."
+            )
+
+        # Only accept a real S2 as task-end if it actually fits
+        # walking_start + task_duration; otherwise leave it to the caller's
+        # time-based estimate.
+        task_end_sample = None
+        if (s2_sample is not None and s2_sample != walking_start_sample
+                and s2_sample > walking_start_sample
+                and _close(s2_sample, walking_start_sample + int(task_duration * self.fs), task_duration)):
+            task_end_sample = s2_sample
+
+        # baseline_start is S1 directly when we have it - it's already the
+        # anchor everything above got checked against - otherwise it's
+        # worked back from walking_start so the two stay consistent.
+        if s1_sample is not None:
+            baseline_start_sample = s1_sample
+        else:
+            baseline_start_sample = walking_start_sample - int(baseline_duration * self.fs)
+
+        description = (
+            f"baseline-start: {'S1 at sample ' + str(s1_sample) if s1_sample is not None else 'inferred at sample ' + str(baseline_start_sample)}; "
+            f"walking-start: {walking_start_source}; task-end: "
+            + (f"S2 at sample {task_end_sample} (matches expected task-end timing)"
+               if task_end_sample is not None else "left to time-based estimate")
+        )
+        return (baseline_start_sample, walking_start_sample, task_end_sample, description)
+
     def _find_walking_start_event(self, events: pd.DataFrame, task_type: str) -> Optional[int]:
         """
-        Find the event marker that indicates walking/task execution start.
-        Enhanced to handle mislabeled events for long walk tasks.
+        Find the marker that signals walking/task start. Falls through a
+        chain of alternatives when the events for a long-walk task are
+        mislabeled or missing the expected marker.
         """
         if task_type not in self.task_walking_events:
-            logger.warning(f" Unknown task type for walking start detection: {task_type}")
+            logger.warning(f"Unknown task type for walking start detection: {task_type}")
             return None
 
         possible_events = self.task_walking_events[task_type]
@@ -1046,20 +1097,15 @@ class FileProcessor:
             matching_events = events_clean[events_clean['Event_Upper'] == event_name.upper()]
             if not matching_events.empty:
                 walking_start_sample = matching_events.iloc[0]['Sample number']
-                logger.info(f"Found walking start event '{event_name}' at sample {walking_start_sample}")
                 return int(walking_start_sample)
 
         task_config = self.task_types.get(task_type, {})
         if task_config.get('type') == 'long_walk':
-            logger.info(f" Long walk task ({task_type}) - checking for alternative event patterns")
             s_events = events_clean[events_clean['Event_Upper'].str.match(r'S[1-9]')]
             if len(s_events) >= 2:
                 s_events_sorted = s_events.sort_values('Sample number').reset_index(drop=True)
                 second_s_event = s_events_sorted.iloc[1]
                 walking_start_sample = second_s_event['Sample number']
-                walking_start_name = second_s_event['Event']
-                logger.info(
-                    f" Long walk fallback: Using '{walking_start_name}' as walking start at sample {walking_start_sample}")
                 return int(walking_start_sample)
 
             s1_events = events_clean[events_clean['Event_Upper'] == 'S1']
@@ -1069,8 +1115,6 @@ class FileProcessor:
                 if not events_after_s1.empty:
                     next_event = events_after_s1.sort_values('Sample number').iloc[0]
                     walking_start_sample = next_event['Sample number']
-                    logger.info(
-                        f" Long walk fallback: Using first event after S1 ('{next_event['Event']}') as walking start at sample {walking_start_sample}")
                     return int(walking_start_sample)
 
         elif task_config.get('type') == 'event_dependent':
@@ -1081,16 +1125,12 @@ class FileProcessor:
                 s2_after_s1 = s2_events[s2_events['Sample number'] > s1_sample]
                 if not s2_after_s1.empty:
                     walking_start_sample = s2_after_s1.iloc[0]['Sample number']
-                    logger.info(
-                        f"Event-dependent task: Using S2 after S1 as walking start at sample {walking_start_sample}")
                     return int(walking_start_sample)
 
                 events_after_s1 = events_clean[events_clean['Sample number'] > s1_sample]
                 if not events_after_s1.empty:
                     next_event = events_after_s1.iloc[0]
                     walking_start_sample = next_event['Sample number']
-                    logger.info(
-                        f" Event-dependent fallback: Using first event after S1 ('{next_event['Event']}') at sample {walking_start_sample}")
                     return int(walking_start_sample)
 
         if task_type == 'LShape':
@@ -1101,46 +1141,39 @@ class FileProcessor:
                     (events_clean['Event_Upper'] == 'W1') & (events_clean['Sample number'] > s2_sample)]
                 if not w1_after_s2.empty:
                     walking_start_sample = w1_after_s2.iloc[0]['Sample number']
-                    logger.info(f" Found L-Shape walking start 'W1' after S2 at sample {walking_start_sample}")
                     return int(walking_start_sample)
 
                 events_after_s2 = events_clean[events_clean['Sample number'] > s2_sample]
                 if not events_after_s2.empty:
                     next_event = events_after_s2.iloc[0]
                     walking_start_sample = next_event['Sample number']
-                    logger.info(
-                        f" L-Shape fallback: Using first event after S2 ('{next_event['Event']}') at sample {walking_start_sample}")
                     return int(walking_start_sample)
 
         if len(events_clean) >= 2:
             events_sorted = events_clean.sort_values('Sample number').reset_index(drop=True)
             second_event = events_sorted.iloc[1]
             walking_start_sample = second_event['Sample number']
-            logger.info(
-                f" General fallback: Using second event ('{second_event['Event']}') as walking start at sample {walking_start_sample}")
             return int(walking_start_sample)
 
-        logger.warning(f" Could not find walking start event for {task_type}")
+        logger.warning(f"Could not find walking start event for {task_type}")
         return None
 
     def _calculate_quality_and_filter(self, data: pd.DataFrame,
                                       channel_groups: dict,
                                       output_dir: str, file_basename: str,
                                       concentration_data: pd.DataFrame) -> Tuple[List[str], QualityReport]:
-        """Calculate channel quality using whichever of SQI/SCI/PSP are in
-        `self.enabled_metrics`, all computed on PRE-TDDR OD (+ PRE-TDDR
-        concentration, for SQI only). A channel fails if ANY enabled,
-        successfully-computed metric fails its threshold. Short channels are
-        spared from exclusion unless `exclude_failing_short_channels=True`.
+        """Score each channel on whichever of SQI/SCI/PSP are enabled, all
+        computed on the pre-TDDR OD (and pre-TDDR concentration, for SQI
+        only). A channel fails if any enabled metric that could actually be
+        computed comes in under threshold. Short channels get a pass on
+        exclusion unless exclude_failing_short_channels is set.
 
-        Returns
-        -------
-        (excluded_od_columns, quality_report)
-            excluded_od_columns : OD column names for channels that should be
-                dropped downstream (empty unless enable_quality_filtering=True).
-            quality_report : QualityReport with one ChannelQuality per channel,
-                for logging/CSV output and for the caller (process_file) to
-                surface to BatchProcessor/PipelineManager.
+        Returns a tuple of (excluded_od_columns, quality_report):
+        excluded_od_columns is the list of OD column names that should be
+        dropped downstream (empty unless enable_quality_filtering is on),
+        and quality_report is a QualityReport with one ChannelQuality entry
+        per channel - used for the CSV output and passed back up to
+        BatchProcessor/PipelineManager via process_file's return value.
         """
         report = QualityReport(
             metrics_used=self.enabled_metrics,
@@ -1150,18 +1183,12 @@ class FileProcessor:
         )
         excluded_channels: List[str] = []
 
-        logger.info(f" Quality calculation ({'+'.join(self.enabled_metrics) or 'none'}) for {file_basename}")
-        logger.info(f"   Thresholds: SQI>={self.sqi_threshold} SCI>={self.sci_threshold} PSP>={self.psp_threshold}")
-        logger.info(f"   Quality filtering: {self.enable_quality_filtering} "
-                    f"(exclude failing short channels: {self.exclude_failing_short_channels})")
-        logger.info(f"   Total channels to evaluate: {len(channel_groups)}")
-
         for ch_id_str, wavelengths in channel_groups.items():
             ch_num = int(re.match(r'CH(\d+)', ch_id_str).group(1))
             is_short = ch_num in SHORT_CHANNEL_IDS
 
             if len(wavelengths) != 2:
-                logger.warning(f" Channel {ch_id_str} has {len(wavelengths)} wavelength(s), need 2 for quality metrics")
+                logger.warning(f"Channel {ch_id_str} has {len(wavelengths)} wavelength(s), need 2 for quality metrics")
                 cq = ChannelQuality(ch_num, is_short, passed=False,
                                     reasons=("insufficient wavelengths",))
                 report.channels.append(cq)
@@ -1214,7 +1241,7 @@ class FileProcessor:
                         reasons.append(f"PSP {psp_val:.3f} < {self.psp_threshold:.2f}")
 
             except Exception as e:
-                logger.warning(f" Quality calculation failed for {ch_id_str}: {str(e)}")
+                logger.warning(f"Quality calculation failed for {ch_id_str}: {str(e)}")
                 reasons.append(f"quality calculation error: {e}")
 
             failed = bool(reasons)
@@ -1232,38 +1259,31 @@ class FileProcessor:
 
             if failed:
                 status = "SPARED (short channel)" if spared else "EXCLUDED" if self.enable_quality_filtering else "KEPT (filtering disabled)"
-                logger.info(f"    FAIL {ch_id_str} [{status}]: {cq.reason_text} "
+                logger.warning(f"  FAIL {ch_id_str} [{status}]: {cq.reason_text} "
                            f"(SQI={sqi_val}, SCI={sci_val}, PSP={psp_val})")
                 if self.enable_quality_filtering and not spared:
                     excluded_channels.extend(list(wavelengths.values()))
-            else:
-                logger.debug(f"    PASS {ch_id_str}: SQI={sqi_val}, SCI={sci_val}, PSP={psp_val}")
 
-        logger.info(f" {report.summary_line()}")
-
-        # Save a single combined quality report (replaces the old two-txt-file SQI-only output)
         quality_suffix = "_filtered" if self.enable_quality_filtering else "_unfiltered"
         report_path = os.path.join(
             output_dir, f"{os.path.splitext(file_basename)[0]}_quality_report{quality_suffix}.csv"
         )
         try:
             report.to_dataframe().to_csv(report_path, index=False)
-            logger.info(f"Saved quality report to: {report_path}")
         except Exception as e:
             logger.warning(f"Failed to save quality report: {e}")
 
-        logger.info(f"QUALITY SUMMARY: {len(report.rejected)} channels excluded of {len(report.channels)} evaluated")
         return excluded_channels, report
 
     def _apply_tddr(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Apply TDDR (temporal derivative distribution repair) motion correction.
+        """Run TDDR (temporal derivative distribution repair) motion correction.
 
-        Only the OD/wavelength signal columns (plus 'Sample number', needed by
-        the tddr implementation) are corrected; all other columns (Event,
-        Time (s), etc.) pass through unchanged. Mirrors
-        FullCapProcessor._apply_tddr so both pipelines apply TDDR the same way,
-        in the same position in the pipeline (after quality metrics, before
-        OD-to-concentration conversion).
+        Only the OD/wavelength columns get corrected, plus 'Sample number'
+        since the tddr implementation needs it - everything else (Event,
+        Time (s), etc.) passes through untouched. This mirrors
+        FullCapProcessor._apply_tddr, so both pipelines run TDDR the same
+        way and in the same spot: after quality metrics, before the
+        OD-to-concentration conversion.
         """
         try:
             signals = data.filter(regex="WL|Sample")
@@ -1276,22 +1296,26 @@ class FileProcessor:
             logger.warning(f"TDDR failed: {str(e)}; continuing with uncorrected OD data")
             return data
 
-
     def _baseline_window_samples(self, events, task_type, n_samples):
-        """Locate the pre-task baseline window (start, end) sample indices used to
-        reference OD -> Delta-OD, mirroring _apply_baseline_correction's choice so
-        the OD reference and the later concentration baseline agree.
+        """Find the pre-task baseline window (start, end sample indices)
+        used to reference OD -> Delta-OD. This has to agree with whatever
+        _apply_baseline_correction picks for its own window, so the OD
+        reference and the later concentration-level baseline correction
+        are anchored to the same period.
 
-        Priority:
-            LShape            : 2nd -> 3rd event markers
-            S1 present + W1    : [S1, W1]   (standard pre-walk standing baseline)
-            S1 present + S2    : [S1, S2]
-            S1 present only    : [S1, S1 + baseline_duration]
-            no usable events   : [0, baseline_duration]   (first baseline_duration s)
+        For LShape this is the 2nd -> 3rd event markers. For long_walk
+        tasks it goes through the same cross-checked resolution that
+        _apply_post_event_trimming uses (_resolve_long_walk_boundaries), so
+        a mislabeled marker - W1 sitting where baseline-start should be, say
+        - gets rejected here exactly like it would there, rather than being
+        trusted on label alone. For everything else, if there's an S1
+        marker, it prefers [S1, W1], then [S1, S2], then finally
+        [S1, S1 + baseline_duration]. With no usable events at all, it
+        just takes the first baseline_duration seconds of the recording.
 
-        Returns (start, end) clamped to [0, n_samples) and required to span at
-        least ~1 s, or None if nothing usable (caller then falls back to the
-        whole-record per-channel mean).
+        Returns (start, end) clamped into [0, n_samples) and guaranteed to
+        span at least about a second, or None if nothing usable came out of
+        that - in which case the caller falls back to a whole-record mean.
         """
         min_span = max(1, int(1.0 * self.fs))
 
@@ -1302,7 +1326,6 @@ class FileProcessor:
                 return None
             return (a, b)
 
-        # Task-timing durations for the event-poor fallbacks.
         file_basename = getattr(self, "_current_file_basename", "")
         timing = self._get_task_timing(file_basename, task_type or "Unknown")
         base_samples = int(timing.get("baseline_duration", 20.0) * self.fs)
@@ -1314,164 +1337,93 @@ class FileProcessor:
             ev["_E"] = ev["Event"].astype(str).str.strip().str.upper()
             ev = ev.sort_values("Sample number").reset_index(drop=True)
 
-            # LShape uses the 2nd -> 3rd markers (matches _apply_lshape_baseline).
+            # LShape: use the 2nd -> 3rd markers, matching _apply_lshape_baseline.
             if task_type == "LShape" and len(ev) >= 3:
                 w = _clamp(ev.iloc[1]["Sample number"], ev.iloc[2]["Sample number"])
                 if w:
-                    logger.info(f" OD baseline reference: LShape 2nd->3rd events {w}")
                     return w
 
-            s1 = ev[ev["_E"] == "S1"]
-            if not s1.empty:
-                s1_s = s1.iloc[0]["Sample number"]
-
-                # Preferred: S1 -> W1 (the requested pre-walk standing baseline).
-                w1 = ev[(ev["_E"] == "W1") & (ev["Sample number"] > s1_s)]
-                if not w1.empty:
-                    w = _clamp(s1_s, w1.iloc[0]["Sample number"])
+            task_config = self.task_types.get(task_type, {})
+            if task_config.get("type") == "long_walk":
+                # Same cross-checked resolution as _apply_post_event_trimming,
+                # so the OD baseline reference and the trimming boundaries
+                # always land on the same real-world timeline. A mislabeled
+                # marker gets rejected here the same way it would there.
+                resolved = self._resolve_long_walk_boundaries(events, task_type, n_samples)
+                if resolved is not None:
+                    baseline_start_sample, walking_start_sample, _task_end, description = resolved
+                    w = _clamp(baseline_start_sample, walking_start_sample)
                     if w:
-                        logger.info(f" OD baseline reference: S1->W1 window {w}")
+                        return w
+                    logger.warning(f"OD baseline reference: resolved boundaries ({description}) "
+                                   f"produced an unusable window; falling back to first "
+                                   f"{base_samples} samples.")
+                # resolved came back None, nothing to work with - drop through
+                # to the "no usable events" branch below.
+            else:
+                s1 = ev[ev["_E"] == "S1"]
+                if not s1.empty:
+                    s1_s = s1.iloc[0]["Sample number"]
+
+                    # Best case: S1 -> W1, the pre-walk standing baseline.
+                    w1 = ev[(ev["_E"] == "W1") & (ev["Sample number"] > s1_s)]
+                    if not w1.empty:
+                        w = _clamp(s1_s, w1.iloc[0]["Sample number"])
+                        if w:
+                            return w
+
+                    # Next best: S1 -> S2.
+                    s2 = ev[(ev["_E"] == "S2") & (ev["Sample number"] > s1_s)]
+                    if not s2.empty:
+                        w = _clamp(s1_s, s2.iloc[0]["Sample number"])
+                        if w:
+                            return w
+
+                    # Just S1: take baseline_duration seconds after it.
+                    w = _clamp(s1_s, s1_s + base_samples)
+                    if w:
                         return w
 
-                # Secondary: S1 -> S2.
-                s2 = ev[(ev["_E"] == "S2") & (ev["Sample number"] > s1_s)]
-                if not s2.empty:
-                    w = _clamp(s1_s, s2.iloc[0]["Sample number"])
-                    if w:
-                        logger.info(f" OD baseline reference: S1->S2 window {w}")
-                        return w
-
-                # S1 only: take baseline_duration seconds after S1.
-                w = _clamp(s1_s, s1_s + base_samples)
-                if w:
-                    logger.info(f" OD baseline reference: S1 + {base_samples} samples {w}")
-                    return w
-
-        # No usable events: reference to the first baseline_duration seconds.
+        # No usable events at all - reference the first baseline_duration seconds.
         w = _clamp(0, base_samples)
         if w:
-            logger.warning(f" OD baseline reference: no S1/W1 markers; using first "
-                           f"{base_samples} samples {w}")
+            logger.warning(f"OD baseline reference: no S1/W1 markers; using first {base_samples} samples {w}")
         else:
-            logger.warning(" OD baseline reference: could not build a baseline window; "
-                           "falling back to whole-record mean.")
-        return w
-
-
-    def _baseline_window_samples(self, events, task_type, n_samples):
-        """Locate the pre-task baseline window (start, end) sample indices used to
-        reference OD -> Delta-OD, mirroring _apply_baseline_correction's choice so
-        the OD reference and the later concentration baseline agree.
-
-        Priority:
-            LShape            : 2nd -> 3rd event markers
-            S1 present + W1    : [S1, W1]   (standard pre-walk standing baseline)
-            S1 present + S2    : [S1, S2]
-            S1 present only    : [S1, S1 + baseline_duration]
-            no usable events   : [0, baseline_duration]   (first baseline_duration s)
-
-        Returns (start, end) clamped to [0, n_samples) and required to span at
-        least ~1 s, or None if nothing usable (caller then falls back to the
-        whole-record per-channel mean).
-        """
-        min_span = max(1, int(1.0 * self.fs))
-
-        def _clamp(a, b):
-            a = int(max(0, min(a, n_samples - 1)))
-            b = int(max(0, min(b, n_samples)))
-            if b - a < min_span:
-                return None
-            return (a, b)
-
-        # Task-timing durations for the event-poor fallbacks.
-        file_basename = getattr(self, "_current_file_basename", "")
-        timing = self._get_task_timing(file_basename, task_type or "Unknown")
-        base_samples = int(timing.get("baseline_duration", 20.0) * self.fs)
-
-        if events is not None and not events.empty and "Event" in events.columns:
-            ev = events.copy()
-            ev["Sample number"] = pd.to_numeric(ev["Sample number"], errors="coerce")
-            ev = ev.dropna(subset=["Sample number"])
-            ev["_E"] = ev["Event"].astype(str).str.strip().str.upper()
-            ev = ev.sort_values("Sample number").reset_index(drop=True)
-
-            # LShape uses the 2nd -> 3rd markers (matches _apply_lshape_baseline).
-            if task_type == "LShape" and len(ev) >= 3:
-                w = _clamp(ev.iloc[1]["Sample number"], ev.iloc[2]["Sample number"])
-                if w:
-                    logger.info(f" OD baseline reference: LShape 2nd->3rd events {w}")
-                    return w
-
-            s1 = ev[ev["_E"] == "S1"]
-            if not s1.empty:
-                s1_s = s1.iloc[0]["Sample number"]
-
-                # Preferred: S1 -> W1 (the requested pre-walk standing baseline).
-                w1 = ev[(ev["_E"] == "W1") & (ev["Sample number"] > s1_s)]
-                if not w1.empty:
-                    w = _clamp(s1_s, w1.iloc[0]["Sample number"])
-                    if w:
-                        logger.info(f" OD baseline reference: S1->W1 window {w}")
-                        return w
-
-                # Secondary: S1 -> S2.
-                s2 = ev[(ev["_E"] == "S2") & (ev["Sample number"] > s1_s)]
-                if not s2.empty:
-                    w = _clamp(s1_s, s2.iloc[0]["Sample number"])
-                    if w:
-                        logger.info(f" OD baseline reference: S1->S2 window {w}")
-                        return w
-
-                # S1 only: take baseline_duration seconds after S1.
-                w = _clamp(s1_s, s1_s + base_samples)
-                if w:
-                    logger.info(f" OD baseline reference: S1 + {base_samples} samples {w}")
-                    return w
-
-        # No usable events: reference to the first baseline_duration seconds.
-        w = _clamp(0, base_samples)
-        if w:
-            logger.warning(f" OD baseline reference: no S1/W1 markers; using first "
-                           f"{base_samples} samples {w}")
-        else:
-            logger.warning(" OD baseline reference: could not build a baseline window; "
+            logger.warning("OD baseline reference: could not build a baseline window; "
                            "falling back to whole-record mean.")
         return w
 
     def _convert_od_to_concentration(self, data, od_cols, channel_groups,
                                      events=None, task_type=None):
-        """Convert OD to Delta-concentration using MBLL and Prahl/OMLC extinction
-        coefficients (cm^-1/M), with per-channel pathlength and OD referenced to the
-        S1->W1 pre-walk baseline window.
+        """Convert OD to Delta-concentration via MBLL, using Prahl/OMLC
+        extinction coefficients (cm^-1/M), per-channel pathlength, and OD
+        referenced to the pre-walk baseline window (normally S1->W1).
 
-        Each channel's OD is referenced to its mean over the baseline window
-        (Delta-OD = OD - mean_baseline(OD)) before the MBLL solve, so the output is
-        Delta[Hb] anchored to the resting/standing period. If no baseline window can
-        be located (events/task_type not supplied, or markers missing), the method
-        falls back to referencing against the whole-record per-channel mean.
+        Each channel's OD gets referenced to its own mean over that
+        baseline window before the MBLL solve - Delta-OD = OD minus the
+        baseline mean - so the resulting Delta[Hb] is anchored to the
+        resting/standing period. If no baseline window can be found
+        (missing events/task_type, or missing markers), it falls back to
+        the first baseline_duration seconds, and if even that can't be
+        built, to the whole-record per-channel mean.
 
-        The extinction table is restricted to the fine 2 nm range around this
-        device's light-source wavelengths (756-759 nm and 846-848 nm); odd-nm
-        entries are linearly interpolated from tabulated even-nm neighbours and
-        847 nm is interpolated from the 846/848 anchors by np.interp.
+        The extinction table only covers the narrow 2nm band around this
+        device's actual light-source wavelengths (756-759nm and
+        846-848nm). Odd-nm entries are linearly interpolated from the
+        tabulated even-nm neighbors, and 847nm comes from interpolating
+        between the 846/848 anchors via np.interp.
         """
         try:
-            DPF = 6.0  # confirmed fixed for this device/protocol
-            DISTANCE_LONG_CM = 3.5  # long channels: 35 mm source-detector separation
-            DISTANCE_SHORT_CM = 1.5  # short channels (CH3/CH5): 15 mm separation
+            DPF = 6.0  # fixed for this device/protocol
+            DISTANCE_LONG_CM = 3.5  # long channels: 35mm source-detector separation
+            DISTANCE_SHORT_CM = 1.5  # short channels (CH3/CH5): 15mm separation
 
-            # Locate the pre-walk baseline window ONCE (same for every channel).
             n_samples = len(data)
             window = self._baseline_window_samples(events, task_type, n_samples)
             if window is not None:
                 b_start, b_end = window
-                logger.info(f" Converting OD to Delta[Hb] referenced to baseline samples "
-                            f"{b_start}-{b_end} (~{(b_end - b_start) / self.fs:.1f}s), "
-                            f"per-channel pathlength")
             else:
                 b_start = b_end = None
-                logger.info(" Converting OD to Delta[Hb] referenced to whole-record mean "
-                            "(no baseline window), per-channel pathlength")
 
             PRAHL_CM1_PER_M = {
                 750: (518.0, 1405.24),
@@ -1524,7 +1476,6 @@ class FileProcessor:
                 if len(wavelengths) != 2:
                     continue
 
-                # Per-channel pathlength: short vs long.
                 ch_match = re.match(r'CH(\d+)', str(ch_id))
                 ch_num = int(ch_match.group(1)) if ch_match else -1
                 is_short = ch_num in SHORT_CHANNEL_IDS
@@ -1569,13 +1520,6 @@ class FileProcessor:
                 concentration_data[f"{ch_id} HbR"] = hbR_uM
                 converted_channels += 1
 
-                logger.debug(
-                    f"{ch_id} ({'short' if is_short else 'long'}, L={L_eff_cm:.1f}cm, "
-                    f"{wl1:.0f}/{wl2:.0f} nm) baseline-referenced Delta means "
-                    f"HbO={np.nanmean(hbO_uM):.3f} uM, HbR={np.nanmean(hbR_uM):.3f} uM")
-
-            logger.info(f" Converted {converted_channels} channels OD -> Delta[Hb] (uM), "
-                        f"pre-walk baseline-referenced")
             return concentration_data if not concentration_data.empty else None
 
         except Exception as e:
@@ -1584,76 +1528,69 @@ class FileProcessor:
 
     def _determine_task_type(self, file_basename: str) -> str:
         """
-        Determine task type from filename with boundary-aware matching.
+        Figure out the task type from the filename using boundary-aware
+        matching.
 
-        IMPORTANT: fTurn is detected ONLY by explicit 'FTURN' or 'F_TURN' patterns.
-        Turn_DT / Turn_ST are walking tasks (not fTurn) and are classified as DT/ST.
+        Worth flagging: fTurn only gets detected from an explicit 'FTURN'
+        or 'F_TURN' in the name. Turn_DT and Turn_ST are walking tasks, not
+        fTurn, and get classified as DT/ST instead.
         """
         s = file_basename.upper()
 
-        # 1. fTurn - ONLY explicit fTurn/F_TURN patterns
         if "FTURN" in s or "F_TURN" in s:
             return "fTurn"
 
-        # 2. LShape
         if "LSHAPE" in s or "L_SHAPE" in s:
             return "LShape"
 
-        # 3. Obstacle
         if "OBSTACLE" in s:
             return "Obstacle"
 
-        # 4. Navigation
         if "NAVIGATION" in s or re.search(r'\bNAV\b', s):
             return "Navigation"
 
-        # 5. DT/ST detection (catches Turn_DT, Walking_DT, Walking_DT-AC, etc.)
-        #    These are all long_walk type tasks with event-based or fallback baseline
+        # Catches Turn_DT, Walking_DT, Walking_DT-AC, etc. - all long_walk
+        # tasks with event-based or fallback baseline handling.
         if re.search(r'(^|[^A-Z])DT([^A-Z]|$)', s):
             return "DT"
         if re.search(r'(^|[^A-Z])ST([^A-Z]|$)', s):
             return "ST"
 
-        # 6. Generic walk (no DT/ST suffix)
         if "WALK" in s:
             return "LongWalk"
 
-        logger.warning(f" Unknown task type from filename: {file_basename}")
+        logger.warning(f"Unknown task type from filename: {file_basename}")
         return "Unknown"
 
     def _validate_task_requirements(self, task_type: str, task_config: dict, events: pd.DataFrame,
                                     filename: str) -> bool:
-        """Validate that task requirements are met before processing."""
+        """Check whether a task has what it needs before we bother processing it."""
         task_category = task_config['type']
         min_events = task_config['min_events']
 
         if task_category == 'event_dependent':
             if events is None or len(events) < min_events:
                 logger.error(
-                    f" {task_type} task requires at least {min_events} event markers, but only found {len(events) if events is not None else 0} in {filename}")
+                    f"{task_type} task requires at least {min_events} event markers, but only found {len(events) if events is not None else 0} in {filename}")
                 return False
 
             if task_type == "LShape":
                 if len(events) < 3:
                     logger.error(
-                        f" L-Shape task requires at least 3 event markers, but only found {len(events)} in {filename}")
+                        f"L-Shape task requires at least 3 event markers, but only found {len(events)} in {filename}")
                     return False
             elif 'S1' not in events['Event'].str.upper().values:
-                logger.error(f" {task_type} task requires 'S1' baseline marker, but not found in {filename}")
+                logger.error(f"{task_type} task requires 'S1' baseline marker, but not found in {filename}")
                 return False
-
-            logger.info(f" {task_type} task validation passed: {len(events)} events found")
 
         elif task_category == 'long_walk':
             if events is None or events.empty:
-                logger.warning(f" {task_type} task has no event markers, will use time-based fallback")
-            else:
-                logger.info(f" {task_type} task has {len(events)} event markers available")
+                logger.warning(f"{task_type} task has no event markers, will use time-based fallback")
 
         return True
 
     def _extract_and_clean_events(self, data_dict: dict, data: pd.DataFrame) -> pd.DataFrame:
-        """Extract and properly clean event data."""
+        """Pull events out of the data dict (or the raw data if needed) and clean them up."""
         try:
             events = data_dict.get('events', None)
 
@@ -1689,7 +1626,7 @@ class FileProcessor:
                 return pd.DataFrame(columns=['Sample number', 'Event'])
 
         except Exception as e:
-            logger.warning(f" Error cleaning events: {str(e)}")
+            logger.warning(f"Error cleaning events: {str(e)}")
             return pd.DataFrame(columns=['Sample number', 'Event'])
 
     @staticmethod
@@ -1710,13 +1647,6 @@ class FileProcessor:
         return "Unknown"
 
     @staticmethod
-    def _get_plotting_limits(subject: str, subject_y_limits: Optional[Dict]) -> Tuple:
-        """Get plotting limits for raw data."""
-        if not subject_y_limits or subject not in subject_y_limits:
-            return None
-        return (subject_y_limits[subject]['raw_min'], subject_y_limits[subject]['raw_max'])
-
-    @staticmethod
     def _prepare_data(raw_data: pd.DataFrame) -> pd.DataFrame:
         """Prepare raw data DataFrame."""
         data = raw_data.copy()
@@ -1725,10 +1655,10 @@ class FileProcessor:
         return data
 
     def _drop_initial_seconds(self, data: pd.DataFrame, seconds: float) -> pd.DataFrame:
-        """Drop the first `seconds` of a recording (device/initialization
-        artifacts), matching FullCapProcessor's initial crop. Renumbers
-        'Sample number' and 'Time (s)' (if present) afterward so downstream
-        code sees a clean, zero-based timeline. No-op if seconds <= 0.
+        """Cut the first few seconds off a recording to get rid of
+        device/init artifacts, same as FullCapProcessor does. Renumbers
+        'Sample number' and 'Time (s)' afterward so everything downstream
+        sees a clean, zero-based timeline. No-op when seconds <= 0.
         """
         if seconds is None or seconds <= 0:
             return data
@@ -1747,51 +1677,101 @@ class FileProcessor:
         if 'Time (s)' in cropped.columns:
             cropped['Time (s)'] = cropped['Sample number'] / self.fs
 
-        logger.info(f"Dropped initial {seconds}s ({n} samples) from recording "
-                    f"({len(data)} -> {len(cropped)} rows)")
         return cropped
 
-    def _apply_scr(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Apply Short Channel Regression (long channels regressed against short channels)."""
-        logger.warning("SCR CHECKPOINT: _apply_scr() was called")
+    def _apply_scr(self, data: pd.DataFrame, quality_report: QualityReport) -> pd.DataFrame:
+        """Short channel regression, matched by hemisphere: CH3 (right
+        short) corrects the right long channels, CH5 (left short) corrects
+        the left ones. See the RIGHT_LONG_IDS/LEFT_LONG_IDS/RIGHT_SHORT_ID/
+        LEFT_SHORT_ID constants up top for the exact mapping, and the
+        caveat about how it was inferred.
 
+        If one side's short channel genuinely failed quality (not just
+        "spared" - see _short_channel_genuinely_passed), we borrow the
+        other side's short channel for both hemispheres instead. If
+        neither one genuinely passed, SCR gets skipped entirely and the
+        long channels stay uncorrected. Either fallback gets written to
+        quality_report.scr_note so it shows up in the stats output too,
+        not just buried in the logs.
+        """
         try:
             sig_cols = [c for c in data.columns if any(k in c for k in ("HbO", "O2Hb", "HHb", "HbR"))]
             if not sig_cols:
+                quality_report.scr_note = "SCR skipped: no signal columns present."
                 return data
 
-            prefixes = {str(c).split()[0] for c in sig_cols if str(c).startswith("CH")}
-            short_ids = {f"CH{i}" for i in SHORT_CHANNEL_IDS}  # CH3, CH5 (0-based) == optodes 4, 6 (1-based)
+            def cols_for(ids: Iterable[int]) -> List[str]:
+                wanted = {f"CH{i}" for i in ids}
+                return [c for c in sig_cols if c.split()[0] in wanted]
 
-            short_prefixes = prefixes & short_ids
-            long_prefixes = prefixes - short_prefixes
+            right_long_cols = cols_for(RIGHT_LONG_IDS)
+            left_long_cols = cols_for(LEFT_LONG_IDS)
+            right_short_cols = cols_for([RIGHT_SHORT_ID])
+            left_short_cols = cols_for([LEFT_SHORT_ID])
 
-            short_cols = [c for c in sig_cols if c.split()[0] in short_prefixes]
-            long_cols = [c for c in sig_cols if c.split()[0] in long_prefixes]
+            right_ok = bool(right_short_cols) and self._short_channel_genuinely_passed(quality_report, RIGHT_SHORT_ID)
+            left_ok = bool(left_short_cols) and self._short_channel_genuinely_passed(quality_report, LEFT_SHORT_ID)
 
-            if not short_cols or not long_cols:
-                if not short_cols:
-                    logger.warning(f"SCR skipped: no short-channel columns ({sorted(short_ids)}) present.")
-                else:
-                    logger.warning("SCR skipped: no long-channel columns present.")
+            if not right_ok and not left_ok:
+                note = (f"SCR skipped: neither short channel (CH{RIGHT_SHORT_ID}, CH{LEFT_SHORT_ID}) "
+                        f"genuinely passed quality; long channels left uncorrected.")
+                logger.warning(note)
+                quality_report.scr_note = note
                 return data
-
-            scr_long = scr_regression(data[long_cols], data[short_cols])
 
             out = data.copy()
-            for col in scr_long.columns:
-                out[col] = scr_long[col]
 
-            logger.info(f"SCR applied: {len(long_cols)} long cols, {len(short_cols)} short cols ({sorted(short_ids)})")
+            def run_side(long_cols: List[str], short_cols: List[str]) -> None:
+                if not long_cols or not short_cols:
+                    return
+                corrected = scr_regression(data[long_cols], data[short_cols])
+                for col in corrected.columns:
+                    out[col] = corrected[col]
+
+            if right_ok and left_ok:
+                run_side(right_long_cols, right_short_cols)
+                run_side(left_long_cols, left_short_cols)
+            elif right_ok:  # left failed
+                run_side(right_long_cols, right_short_cols)
+                run_side(left_long_cols, right_short_cols)
+                note = (f"SCR: left short channel (CH{LEFT_SHORT_ID}) failed quality; "
+                        f"used right short channel (CH{RIGHT_SHORT_ID}) for both hemispheres.")
+                logger.warning(note)
+                quality_report.scr_note = note
+            else:  # right failed, left_ok
+                run_side(left_long_cols, left_short_cols)
+                run_side(right_long_cols, left_short_cols)
+                note = (f"SCR: right short channel (CH{RIGHT_SHORT_ID}) failed quality; "
+                        f"used left short channel (CH{LEFT_SHORT_ID}) for both hemispheres.")
+                logger.warning(note)
+                quality_report.scr_note = note
+
             return out
 
         except Exception as e:
             logger.warning(f"SCR failed: {str(e)}")
+            quality_report.scr_note = f"SCR failed with exception: {e}"
             return data
+
+    @staticmethod
+    def _short_channel_genuinely_passed(quality_report: QualityReport, channel: int) -> bool:
+        """True for a clean pass only, not for a short channel that got
+        "spared" despite failing. With exclude_failing_short_channels=False
+        (the default), a failing short channel still gets marked
+        passed=True so it stays in the dataset - but SCR needs to know it
+        actually failed, otherwise the fallback logic above would never
+        kick in for a genuinely bad short channel. A clean pass has an
+        empty reasons tuple; a spared-but-failing one always carries a
+        "short channel kept despite: ..." reason even though passed=True.
+        """
+        for c in quality_report.channels:
+            if c.channel == channel:
+                return c.passed and not c.reasons
+        return False
 
     def _apply_baseline_correction(self, data: pd.DataFrame, events: pd.DataFrame,
                                    task_type: str = None) -> pd.DataFrame:
-        """Apply task-specific baseline correction."""
+        """Dispatch to whichever baseline correction approach fits the task."""
         try:
             if events is None or events.empty:
                 logger.warning("No events available for baseline correction, using fallback")
@@ -1810,12 +1790,12 @@ class FileProcessor:
             return None
 
     def _apply_lshape_baseline(self, data: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
-        """Apply L-Shape specific baseline correction using 2nd to 3rd event markers."""
+        """L-Shape's baseline correction: uses the 2nd and 3rd event markers as start/end."""
         try:
             events_sorted = events.sort_values('Sample number').reset_index(drop=True)
 
             if len(events_sorted) < 3:
-                logger.error(f" L-Shape task requires at least 3 event markers, but only found {len(events_sorted)}")
+                logger.error(f"L-Shape task requires at least 3 event markers, but only found {len(events_sorted)}")
                 return None
 
             second_event = events_sorted.iloc[1]
@@ -1825,7 +1805,7 @@ class FileProcessor:
             third_sample = third_event['Sample number']
 
             if third_sample <= second_sample:
-                logger.error(f" L-Shape baseline error: events out of order")
+                logger.error("L-Shape baseline error: events out of order")
                 return None
 
             baseline_events = pd.DataFrame({
@@ -1833,7 +1813,6 @@ class FileProcessor:
                 'Event': ['BaselineStart', 'BaselineEnd']
             })
 
-            logger.info(f" L-Shape baseline correction: {second_event['Event']} to {third_event['Event']}")
             return baseline_subtraction(data, baseline_events, baseline_type="lshape_task")
 
         except Exception as e:
@@ -1841,10 +1820,30 @@ class FileProcessor:
             return None
 
     def _apply_standard_baseline(self, data: pd.DataFrame, events: pd.DataFrame, task_type: str = None) -> pd.DataFrame:
-        """Apply standard baseline correction for non-L-Shape tasks."""
+        """Baseline correction for everything except L-Shape."""
         try:
-            s1_markers = events[events['Event'] == 'S1']
+            task_config = self.task_types.get(task_type, {})
 
+            if task_config.get('type') == 'long_walk':
+                # Same cross-checked resolution as _baseline_window_samples
+                # and _apply_post_event_trimming, so the OD reference, this
+                # concentration-level correction, and the trimming
+                # boundaries all agree on one consistent timeline. A
+                # mislabeled marker gets rejected here the same as anywhere
+                # else in the pipeline.
+                resolved = self._resolve_long_walk_boundaries(events, task_type, len(data))
+                if resolved is not None:
+                    baseline_start_sample, walking_start_sample, _task_end, description = resolved
+                    if walking_start_sample > baseline_start_sample:
+                        baseline_events = pd.DataFrame({
+                            'Sample number': [baseline_start_sample, walking_start_sample],
+                            'Event': ['BaselineStart', 'BaselineEnd']
+                        })
+                        return baseline_subtraction(data, baseline_events, baseline_type="long_walk")
+                logger.warning("No usable baseline markers found for long walk task, using time-based fallback")
+                return self._fallback_baseline_correction(data, task_type)
+
+            s1_markers = events[events['Event'] == 'S1']
             if not s1_markers.empty:
                 s1_sample = s1_markers.iloc[0]['Sample number']
 
@@ -1870,13 +1869,8 @@ class FileProcessor:
                     })
                     return baseline_subtraction(data, baseline_events, baseline_type="event_based")
 
-            task_config = self.task_types.get(task_type, {})
-            if task_config.get('type') == 'long_walk':
-                logger.warning("No event-based baseline found for long walk task, using time-based fallback")
-                return self._fallback_baseline_correction(data, task_type)
-            else:
-                logger.error(" No valid baseline markers found for event-dependent task")
-                return None
+            logger.error("No valid baseline markers found for event-dependent task")
+            return None
 
         except Exception as e:
             logger.error(f"Standard baseline correction failed: {str(e)}")
@@ -1884,16 +1878,14 @@ class FileProcessor:
 
     def _fallback_baseline_correction(self, data: pd.DataFrame, task_type: str = None) -> pd.DataFrame:
         """
-        Fallback baseline correction using task-specific timing calculated from
-        end-of-recording.
-
-        Uses _get_task_timing() to determine correct durations based on the
-        actual filename (90s vs 150s tasks).
+        Baseline correction with no real events to work from - counts
+        backward from the end of the recording using task-specific timing
+        from _get_task_timing(), which already knows whether this is a 90s
+        or 150s task based on the filename.
         """
         try:
             total = len(data)
 
-            # Get task-specific timing from the current filename
             file_basename = getattr(self, '_current_file_basename', '')
             timing = self._get_task_timing(file_basename, task_type or 'Unknown')
 
@@ -1901,16 +1893,12 @@ class FileProcessor:
             baseline_duration = timing['baseline_duration']
             end_duration = timing['end_duration']
 
-            logger.info(f"Fallback baseline using timing: {total_expected}s total "
-                        f"({baseline_duration}s baseline, {end_duration}s end)")
-
             min_required = int(baseline_duration * self.fs)
             if total < min_required:
                 logger.warning(f"Fallback baseline: record too short ({total} samples < {min_required} required); "
                                f"returning data without subtraction")
                 return data
 
-            # Calculate baseline window from end of recording
             s1 = max(0, min(total - 1, int(total - total_expected * self.fs)))
             s2 = max(0, min(total - 1, int(total - (total_expected - baseline_duration) * self.fs)))
             s3 = max(0, min(total - 1, int(total - end_duration * self.fs)))
@@ -1938,24 +1926,26 @@ class FileProcessor:
                           task_type: str, task_config: dict,
                           events: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         """
-        Final output step with Z-transformation applied BEFORE averaging.
-        NOTE: Post-event trimming is already applied in _process_pipeline_stages.
+        Build and save the final outputs, running Z-transformation before
+        averaging rather than after. Post-event trimming has already
+        happened back in _process_pipeline_stages, so this is purely
+        averaging/saving/plotting. If compute_zscore is False, the whole
+        Z-transformation path - averaging, CSV, plot - gets skipped, and
+        only RAW comes out.
         """
         try:
-            # NOTE: Trimming already happened in _process_pipeline_stages - do NOT apply again
-
-            logger.info("Creating non-Z-transformed averaged data")
-            # Pass the montage explicitly rather than letting average_channels()
-            # guess zero- vs one-based numbering from whether CH0 happens to be
-            # present. If SQI filtering ever drops CH0 specifically, that guess
-            # would silently flip to the wrong montage table (see
-            # SHORT_CHANNEL_IDS comment at top of this module for the source of
-            # truth); passing short/left/right explicitly avoids that entirely.
+            # Passing the montage explicitly here rather than letting
+            # average_channels() guess zero- vs one-based numbering from
+            # whether CH0 happens to be present. If SQI filtering ever drops
+            # CH0 specifically, that guess could silently flip to the wrong
+            # montage table (see the SHORT_CHANNEL_IDS comment up top for
+            # where this mapping actually comes from) - being explicit here
+            # avoids that failure mode entirely.
             averaged_raw = average_channels(
                 data.copy(),
                 short_ids=sorted(SHORT_CHANNEL_IDS),
-                left_ids=[4, 6, 7],
-                right_ids=[0, 1, 2],
+                left_ids=list(LEFT_LONG_IDS),
+                right_ids=list(RIGHT_LONG_IDS),
             )
 
             for col in ['grand oxy', 'grand deoxy']:
@@ -1963,43 +1953,41 @@ class FileProcessor:
                     logger.warning(f"Missing '{col}' after averaging; filling with NaNs.")
                     averaged_raw[col] = np.nan
 
-            logger.info("Applying Z-transformation to INDIVIDUAL channels before averaging")
+            averaged_z = None
+            if self.compute_zscore:
+                signal_cols = [col for col in data.columns
+                               if any(kw in col for kw in ['HbO', 'HbR', 'O2Hb', 'HHb'])
+                               and pd.api.types.is_numeric_dtype(data[col])
+                               and 'grand' not in col.lower()]
 
-            signal_cols = [col for col in data.columns
-                           if any(kw in col for kw in ['HbO', 'HbR', 'O2Hb', 'HHb'])
-                           and pd.api.types.is_numeric_dtype(data[col])
-                           and 'grand' not in col.lower()]
+                if signal_cols:
+                    z_transformed_data = z_transformation(data.copy(), signal_cols)
+                else:
+                    logger.warning("No individual signal channels found for Z-transformation")
+                    z_transformed_data = data.copy()
 
-            if signal_cols:
-                logger.info(f"Z-transforming {len(signal_cols)} individual channels")
-                z_transformed_data = z_transformation(data.copy(), signal_cols)
-            else:
-                logger.warning("No individual signal channels found for Z-transformation")
-                z_transformed_data = data.copy()
+                averaged_z = average_channels(
+                    z_transformed_data,
+                    short_ids=sorted(SHORT_CHANNEL_IDS),
+                    left_ids=list(LEFT_LONG_IDS),
+                    right_ids=list(RIGHT_LONG_IDS),
+                )
 
-            logger.info("Averaging Z-transformed channels")
-            averaged_z = average_channels(
-                z_transformed_data,
-                short_ids=sorted(SHORT_CHANNEL_IDS),
-                left_ids=[4, 6, 7],
-                right_ids=[0, 1, 2],
-            )
+                for col in ['grand oxy', 'grand deoxy']:
+                    if col not in averaged_z.columns:
+                        averaged_z[col] = np.nan
 
-            for col in ['grand oxy', 'grand deoxy']:
-                if col not in averaged_z.columns:
-                    averaged_z[col] = np.nan
-
-            for df_version in [averaged_raw, averaged_z]:
+            df_versions = [averaged_raw] + ([averaged_z] if averaged_z is not None else [])
+            for df_version in df_versions:
                 if 'Sample number' in df_version.columns:
                     df_version['Time (s)'] = df_version['Sample number'] / self.fs
                 else:
                     df_version['Time (s)'] = np.arange(len(df_version)) / self.fs
 
             task_category = task_config.get('type', 'unknown')
-            # Use the original source filename (without extension) for traceability
             source_filename = os.path.splitext(file_basename)[0]
 
-            for df_version in [averaged_raw, averaged_z]:
+            for df_version in df_versions:
                 df_version['Condition'] = source_filename
                 df_version['Subject'] = subject
                 df_version['TaskType'] = source_filename
@@ -2013,13 +2001,10 @@ class FileProcessor:
 
             output_file_raw = os.path.join(condition_dir, f"{file_basename}_FULLY_PROCESSED_RAW{quality_suffix}.csv")
             averaged_raw.to_csv(output_file_raw, index=False)
-            logger.info(f" Saved RAW (non-Z-scored) data to {output_file_raw}")
-            logger.info(f"   Grand oxy mean: {averaged_raw['grand oxy'].mean():.6f}")
-            logger.info(f"   Grand deoxy mean: {averaged_raw['grand deoxy'].mean():.6f}")
 
-            output_file_z = os.path.join(condition_dir, f"{file_basename}_FULLY_PROCESSED_ZSCORE{quality_suffix}.csv")
-            averaged_z.to_csv(output_file_z, index=False)
-            logger.info(f" Saved Z-SCORED data to {output_file_z}")
+            if averaged_z is not None:
+                output_file_z = os.path.join(condition_dir, f"{file_basename}_FULLY_PROCESSED_ZSCORE{quality_suffix}.csv")
+                averaged_z.to_csv(output_file_z, index=False)
 
             try:
                 plot_condition = task_type
@@ -2031,19 +2016,20 @@ class FileProcessor:
                     f'Final Overall - Raw Concentrations{quality_suffix}', events
                 )
 
-                self._create_final_plot(
-                    averaged_z, condition_dir, file_basename, f"{plot_condition}{quality_suffix}",
-                    ['grand oxy', 'grand deoxy'],
-                    f'final_overall_ZSCORE{quality_suffix}',
-                    f'Final Overall - Z-scores{quality_suffix}', events
-                )
+                if averaged_z is not None:
+                    self._create_final_plot(
+                        averaged_z, condition_dir, file_basename, f"{plot_condition}{quality_suffix}",
+                        ['grand oxy', 'grand deoxy'],
+                        f'final_overall_ZSCORE{quality_suffix}',
+                        f'Final Overall - Z-scores{quality_suffix}', events
+                    )
             except Exception as e:
-                logger.warning(f" Plotting failed for {file_basename}: {e}")
+                logger.warning(f"Plotting failed for {file_basename}: {e}")
 
             return averaged_raw
 
         except Exception as e:
-            logger.error(f" Final output generation failed: {str(e)}", exc_info=True)
+            logger.error(f"Final output generation failed: {str(e)}", exc_info=True)
             return None
 
     def _create_final_plot(self, data: pd.DataFrame, output_dir: str,
@@ -2051,7 +2037,7 @@ class FileProcessor:
                            columns: List[str], prefix: str,
                            title: str,
                            events: Optional[pd.DataFrame] = None) -> None:
-        """Create standardized final plots with automatic scaling and (remapped) events."""
+        """Build one of the final overall plots, with auto-scaled axes and events remapped to line up with the trimmed data."""
         try:
             if 'Time (s)' not in data.columns:
                 data = data.copy()
@@ -2113,9 +2099,6 @@ class FileProcessor:
             output_path = os.path.join(output_dir, f"{prefix}_{condition}.png")
             self._save_figure(fig, output_path)
 
-            event_count = len(clean_events) if clean_events is not None else 0
-            logger.info(f"Successfully created {title} plot with {event_count} event markers: {output_path}")
-
         except Exception as e:
             logger.error(f"Failed to create {title} plot for {file_basename}: {str(e)}", exc_info=True)
             raise
@@ -2127,7 +2110,6 @@ class FileProcessor:
             fig.tight_layout()
             fig.savefig(path, dpi=300, bbox_inches='tight')
             plt.close(fig)
-            logger.debug(f"Saved figure to {path}")
         except Exception as e:
             plt.close(fig)
             logger.error(f"Failed to save figure {os.path.basename(path)}: {str(e)}")
