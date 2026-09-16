@@ -1,17 +1,3 @@
-"""Batch execution: discover recordings, run the pipeline.
-
-:class:`BatchProcessor` is the execution engine of the orchestration layer. For
-each recording it hands the file straight to
-:class:`~fnirs_PFC_2025.processing.file_processor.FileProcessor`, which now
-performs channel-quality scoring (any combination of SQI/SCI/PSP) and
-filtering internally - there is no separate prefilter here anymore.
-
-It groups recordings by task type, tracks per-task outcomes, and collects the
-per-recording quality reports (surfaced by FileProcessor's ``process_file``
-return value). It does not compute statistics or plots - that is
-:class:`PipelineManager`'s job.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -41,7 +27,7 @@ _VALIDATION_MARKERS = ("requires at least", "task requirements", "validation")
 
 @dataclass
 class BatchResult:
-    """Aggregate outcome of a batch run."""
+    """What came out of one batch run."""
 
     processed_files: List[str] = field(default_factory=list)
     skipped_files: List[str] = field(default_factory=list)
@@ -57,7 +43,7 @@ class BatchResult:
 
 
 class BatchProcessor:
-    """Discover recordings under a directory tree and process each one."""
+    """Walks a directory tree looking for recordings and runs each one through the pipeline."""
 
     def __init__(
         self,
@@ -70,29 +56,36 @@ class BatchProcessor:
         exclude_failing_short_channels: bool = False,
         post_walking_trim_seconds: float = 3.0,
         initial_crop_seconds: float = 1.0,
+        skip_diagnostic_plots: bool = False,
+        compute_zscore: bool = True,
         file_extension: str = ".txt",
         read_file_func: Callable = read_txt_file,
     ) -> None:
         """
-        Args:
-            fs: Sampling frequency in Hz
-            sqi_threshold, sci_threshold, psp_threshold: per-metric thresholds,
-                passed straight through to FileProcessor.
-            enabled_metrics: which of "sqi", "sci", "psp" gate channel exclusion.
-                Default ("sci", "psp") - SQI is opt-in. Passed straight through
-                to FileProcessor, which is now the single place quality control
-                happens for this pipeline.
-            enable_quality_filtering: if True (default), channels failing an
-                enabled metric are dropped; if False, quality is still computed
-                and reported but nothing is removed.
-            exclude_failing_short_channels: if True, short channels (CH3/CH5)
-                that fail are also dropped, instead of being spared by default.
-            post_walking_trim_seconds: seconds to trim after walking start event.
-            initial_crop_seconds: seconds to drop from the start of every
-                recording (device/initialization artifacts). Default 1.0s,
-                matching FullCapProcessor's initial crop.
-            file_extension: extension to search for when discovering recordings.
-            read_file_func: loader callable, ``read_txt_file``-compatible.
+        fs is the sampling rate in Hz. sqi_threshold, sci_threshold and
+        psp_threshold are per-metric thresholds passed straight through to
+        FileProcessor. enabled_metrics picks which of "sqi", "sci", "psp"
+        actually gate channel exclusion - default is ("sci", "psp"), SQI has
+        to be turned on explicitly - and this also passes straight through,
+        since FileProcessor is where all the quality control for this
+        pipeline actually lives now.
+
+        enable_quality_filtering (default True) controls whether a channel
+        failing an enabled metric gets dropped, or just flagged in the
+        report while staying in the data. exclude_failing_short_channels, if
+        True, drops CH3/CH5 too when they fail, instead of sparing them by
+        default.
+
+        post_walking_trim_seconds is how much to trim after the walking-start
+        event. initial_crop_seconds trims the start of every recording for
+        device/init artifacts - default 1.0s, matching FullCapProcessor.
+        skip_diagnostic_plots turns off the five per-stage plots plus the
+        summary panel for every recording; compute_zscore, if False, skips
+        Z-transformation for every recording so only RAW comes out. Both
+        pass straight through to FileProcessor.
+
+        file_extension is what to look for when scanning for recordings, and
+        read_file_func is the loader - anything read_txt_file-compatible.
         """
         self.fs = fs
         self.sqi_threshold = sqi_threshold
@@ -103,6 +96,8 @@ class BatchProcessor:
         self.exclude_failing_short_channels = exclude_failing_short_channels
         self.post_walking_trim_seconds = post_walking_trim_seconds
         self.initial_crop_seconds = initial_crop_seconds
+        self.skip_diagnostic_plots = skip_diagnostic_plots
+        self.compute_zscore = compute_zscore
         self._extension = file_extension.lower()
         self._read_file_func = read_file_func
         self._processor = FileProcessor(
@@ -115,20 +110,20 @@ class BatchProcessor:
             exclude_failing_short_channels=exclude_failing_short_channels,
             post_walking_trim_seconds=post_walking_trim_seconds,
             initial_crop_seconds=initial_crop_seconds,
+            skip_diagnostic_plots=skip_diagnostic_plots,
+            compute_zscore=compute_zscore,
         )
         logger.info(
-            "BatchProcessor ready (fs=%.1f Hz, metrics=%s, thresholds: SQI>=%.2f "
-            "SCI>=%.2f PSP>=%.2f, quality filtering=%s, initial crop=%.1fs, "
-            "post-walk trim=%.1fs).",
-            fs, self.enabled_metrics, sqi_threshold, sci_threshold, psp_threshold,
-            enable_quality_filtering, initial_crop_seconds, post_walking_trim_seconds,
+            "BatchProcessor ready (fs=%.1f Hz, metrics=%s, quality filtering=%s, Z-score=%s).",
+            fs, self.enabled_metrics, enable_quality_filtering,
+            "on" if compute_zscore else "off",
         )
 
     # ----- discovery ------------------------------------------------------ #
     def find_input_files(
         self, input_dir: str, task_filter: Optional[Sequence[str]] = None
     ) -> Dict[str, List[str]]:
-        """Return input files under ``input_dir`` grouped by task type."""
+        """Walk input_dir and group whatever recordings it finds by task type."""
         wanted = set(task_filter) if task_filter else None
         grouped: Dict[str, List[str]] = {}
         for root, _dirs, files in os.walk(input_dir):
@@ -153,10 +148,9 @@ class BatchProcessor:
         input_dir: str,
         output_dir: str,
         task_filter: Optional[Sequence[str]] = None,
-        subject_y_limits: Optional[Dict[str, Dict[str, float]]] = None,
         show_progress: bool = True,
     ) -> BatchResult:
-        """Process every discovered recording, continuing past failures."""
+        """Run every discovered recording; one bad file doesn't stop the rest."""
         task_files = self.find_input_files(input_dir, task_filter)
         if not task_files:
             raise FileNotFoundError(f"No {self._extension} files found under {input_dir!r}.")
@@ -168,9 +162,8 @@ class BatchProcessor:
         )
 
         for task, files in task_files.items():
-            logger.info("Processing task %s (%d file(s)).", task, len(files))
             for path in self._with_progress(files, task, show_progress):
-                outcome = self._process_one(path, input_dir, output_dir, subject_y_limits, batch)
+                outcome = self._process_one(path, input_dir, output_dir, batch)
                 batch.by_task[task][outcome].append(path)
                 (batch.processed_files if outcome == "processed" else batch.skipped_files).append(path)
 
@@ -184,20 +177,17 @@ class BatchProcessor:
         file_path: str,
         input_dir: str,
         output_dir: str,
-        subject_y_limits: Optional[Dict[str, Dict[str, float]]],
         batch: BatchResult,
     ) -> str:
-        """Process a single recording (FileProcessor does its own quality control
-        internally); return its outcome and record the quality report."""
+        """Run one recording (FileProcessor handles its own quality control) and report back what happened."""
         try:
             result = self._processor.process_file(
                 file_path=file_path,
                 output_base_dir=output_dir,
                 input_base_dir=input_dir,
-                subject_y_limits=subject_y_limits,
                 read_file_func=self._read_file_func,
             )
-        except Exception as exc:  # noqa: BLE001 - keep the batch alive on any one file
+        except Exception as exc:  # noqa: BLE001 - one bad file shouldn't kill the whole batch
             outcome = self._classify_error(str(exc))
             logger.error("%s on %s: %s", outcome, os.path.basename(file_path), exc)
             return outcome
@@ -222,7 +212,7 @@ class BatchProcessor:
 
     # ----- reporting ------------------------------------------------------ #
     def _write_processing_report(self, batch: BatchResult, output_dir: str) -> Path:
-        """Write a plain-text per-task processing report."""
+        """Write out a plain-text summary of how the batch went, one section per task."""
         path = Path(output_dir) / "processing_report.txt"
         lines = [
             "fNIRS processing report",
@@ -234,6 +224,7 @@ class BatchProcessor:
             f"Thresholds       : SQI>={self.sqi_threshold}, SCI>={self.sci_threshold}, PSP>={self.psp_threshold}",
             f"Quality filtering: {'on' if self.enable_quality_filtering else 'off'}",
             f"Post-walk trim   : {self.post_walking_trim_seconds} s",
+            f"Diagnostic plots : {'off' if self.skip_diagnostic_plots else 'on'}",
             "",
         ]
         for task in sorted(batch.by_task):
@@ -250,13 +241,12 @@ class BatchProcessor:
             for failed_path in batch.by_task[task]["failed"]:
                 lines.append(f"    failed    : {os.path.basename(failed_path)}")
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        logger.info("Wrote processing report: %s", path.name)
         return path
 
     # ----- internals ------------------------------------------------------ #
     @staticmethod
     def _classify_error(message: str) -> str:
-        """Map an exception message to an outcome category."""
+        """Decide whether an exception message points to a validation problem or something worse."""
         lowered = message.lower()
         if any(marker in lowered for marker in _VALIDATION_MARKERS):
             return "validation_failed"
@@ -264,7 +254,7 @@ class BatchProcessor:
 
     @staticmethod
     def _with_progress(files: Sequence[str], task: str, show_progress: bool):
-        """Wrap an iterable in a tqdm bar when available and requested."""
+        """Show a tqdm progress bar if it's installed and the caller wants one; otherwise just return the list."""
         if not show_progress:
             return files
         try:
@@ -275,7 +265,7 @@ class BatchProcessor:
 
     @staticmethod
     def _determine_task_type(filename: str) -> str:
-        """Classify a recording by filename using boundary-aware keyword matching."""
+        """Guess the task type from a filename, using boundary-aware keyword checks."""
         basename = os.path.basename(filename).upper()
         if "FTURN" in basename or "F_TURN" in basename:
             return "fTurn"
