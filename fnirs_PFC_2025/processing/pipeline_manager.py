@@ -4,7 +4,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -21,12 +21,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StudyResult:
-    """Everything a run produces btw"""
+    """Everything a single PipelineManager.run() call produces."""
 
     batch: BatchResult
     stats_raw: Optional[pd.DataFrame] = None
     stats_zscore: Optional[pd.DataFrame] = None
-    y_limits: Dict[str, Dict[str, float]] = field(default_factory=dict)
     summary_paths: List[Path] = field(default_factory=list)
     qc_summary_path: Optional[Path] = None
 
@@ -40,7 +39,7 @@ class StudyResult:
 
 
 class PipelineManager:
-    """Run a whole study: process (with quality control) -> y-limits -> statistics -> reports."""
+    """Runs an entire study end to end: process (with quality control), then statistics, then reports."""
 
     def __init__(
         self,
@@ -53,25 +52,32 @@ class PipelineManager:
         exclude_failing_short_channels: bool = False,
         post_walking_trim_seconds: float = 3.0,
         initial_crop_seconds: float = 1.0,
+        skip_diagnostic_plots: bool = False,
+        compute_zscore: bool = True,
     ) -> None:
         """
-        Args:
-            fs: Sampling frequency in Hz
-            sqi_threshold, sci_threshold, psp_threshold: per-metric thresholds,
-                passed straight through to BatchProcessor -> FileProcessor.
-            enabled_metrics: which of "sqi", "sci", "psp" gate channel exclusion.
-                Default ("sci", "psp") - SQI is opt-in.
-            enable_quality_filtering: if True (default), channels failing an
-                enabled metric are dropped; if False, quality is still computed
-                and reported but nothing is removed.
-            exclude_failing_short_channels: if True, short channels (CH3/CH5)
-                that fail are also dropped, instead of being spared by default.
-            post_walking_trim_seconds: seconds to trim after walking start event.
-            initial_crop_seconds: seconds to drop from the start of every
-                recording (device/initialization artifacts). Default 1.0s,
-                matching FullCapProcessor's initial crop.
+        fs is the sampling rate in Hz. sqi_threshold, sci_threshold and
+        psp_threshold are per-metric thresholds that flow straight through
+        to BatchProcessor and then FileProcessor. enabled_metrics picks
+        which of "sqi", "sci", "psp" gate channel exclusion - default is
+        ("sci", "psp"), with SQI opt-in.
+
+        enable_quality_filtering (default True) drops channels that fail
+        an enabled metric; set it False and quality still gets computed and
+        reported, just nothing gets removed. exclude_failing_short_channels,
+        if True, drops CH3/CH5 too instead of sparing them.
+
+        post_walking_trim_seconds is the trim after the walking-start event.
+        initial_crop_seconds trims the start of every recording for device
+        warm-up artifacts (1.0s default, matching FullCapProcessor).
+        skip_diagnostic_plots turns off the per-stage plots and summary
+        panel across the whole study. compute_zscore, if False, skips
+        Z-transformation for every recording - only RAW comes out, and the
+        ZSCORE statistics pass gets skipped too since there'd be nothing
+        to aggregate.
         """
         self.fs = fs
+        self._compute_zscore = compute_zscore
         self._batch = BatchProcessor(
             fs=fs,
             sqi_threshold=sqi_threshold,
@@ -82,6 +88,8 @@ class PipelineManager:
             exclude_failing_short_channels=exclude_failing_short_channels,
             post_walking_trim_seconds=post_walking_trim_seconds,
             initial_crop_seconds=initial_crop_seconds,
+            skip_diagnostic_plots=skip_diagnostic_plots,
+            compute_zscore=compute_zscore,
         )
         self._stats = StatsCollector(fs=fs, enable_quality_filtering=enable_quality_filtering)
 
@@ -90,13 +98,11 @@ class PipelineManager:
         input_dir: str,
         output_dir: str,
         task_filter: Optional[Sequence[str]] = None,
-        consistent_ylimits: bool = True,
         show_progress: bool = True,
     ) -> StudyResult:
-        """Execute the full study workflow and return a :class:`StudyResult`."""
+        """Run the whole study - processing, then stats, then reports - and hand back a StudyResult."""
         os.makedirs(output_dir, exist_ok=True)
 
-        logger.info("Pass 1: processing (quality control runs inside FileProcessor).")
         batch = self._batch.process(
             input_dir, output_dir, task_filter=task_filter, show_progress=show_progress
         )
@@ -106,20 +112,10 @@ class PipelineManager:
             study.qc_summary_path = self._write_qc_summary(batch, output_dir)
             return study
 
-        y_limits = self._stats.calculate_subject_y_limits(
-            batch.processed_files, output_dir, input_dir
-        )
-
-        if consistent_ylimits and y_limits:
-            logger.info("Pass 2: re-processing with consistent per-subject y-limits.")
-            batch = self._batch.process(
-                input_dir, output_dir, task_filter=task_filter,
-                subject_y_limits=y_limits, show_progress=show_progress,
-            )
-
-        study = StudyResult(batch=batch, y_limits=y_limits)
+        study = StudyResult(batch=batch)
         study.stats_raw = self._aggregate(batch.processed_files, input_dir, output_dir, "RAW")
-        study.stats_zscore = self._aggregate(batch.processed_files, input_dir, output_dir, "ZSCORE")
+        if self._compute_zscore:
+            study.stats_zscore = self._aggregate(batch.processed_files, input_dir, output_dir, "ZSCORE")
         study.summary_paths = self._write_summaries(study, output_dir)
         study.qc_summary_path = self._write_qc_summary(batch, output_dir)
         return study
@@ -132,7 +128,7 @@ class PipelineManager:
         output_dir: str,
         file_type: str,
     ) -> Optional[pd.DataFrame]:
-        """Run the stats collector for one file type and save the combined CSV."""
+        """Run the stats collector on one file type (RAW or ZSCORE) and save the combined CSV."""
         stats = self._stats.run_statistics(processed_files, input_dir, output_dir, file_type)
         if stats is None or stats.empty:
             return stats
@@ -142,20 +138,24 @@ class PipelineManager:
         return stats
 
     def _write_summaries(self, study: StudyResult, output_dir: str) -> List[Path]:
-        """Write per-task summary sheets for both RAW and ZSCORE statistics."""
+        """Write the per-task summary sheets - RAW always, ZSCORE too if it got computed."""
         written: List[Path] = []
-        for stats, suffix in ((study.stats_raw, "_RAW"), (study.stats_zscore, "_ZSCORE")):
+        pairs = [(study.stats_raw, "_RAW")]
+        if self._compute_zscore:
+            pairs.append((study.stats_zscore, "_ZSCORE"))
+        for stats, suffix in pairs:
             written.extend(self._stats.create_summary_sheets(stats, output_dir, suffix=suffix))
         return written
 
     # ----- QC roll-up ----------------------------------------------------- #
     def _write_qc_summary(self, batch: BatchResult, output_dir: str) -> Optional[Path]:
-        """Write one row per recording summarising quality-filtering outcomes.
+        """One row per recording, summarizing how quality filtering went for it.
 
-        Unchanged from before the quality-control consolidation: QualityReport
-        still exposes .channels / .retained / .rejected / .n_long_retained /
-        .n_long_total, now populated by FileProcessor instead of the old
-        external ChannelQualityControl prefilter.
+        Includes the SCR note (blank if SCR ran normally; otherwise which
+        fallback kicked in, or that SCR got skipped entirely), so a
+        hemisphere borrowing the other side's short channel - or losing SCR
+        altogether - shows up at the study level instead of only sitting in
+        one recording's logs.
         """
         rows = []
         for file_path, report in batch.qc_reports.items():
@@ -167,6 +167,7 @@ class PipelineManager:
                 "Long retained": report.n_long_retained,
                 "Long total": report.n_long_total,
                 "Rejected": ";".join(f"CH{c.channel}" for c in report.rejected) or "-",
+                "SCR Note": report.scr_note or "-",
             })
         if not rows:
             return None
