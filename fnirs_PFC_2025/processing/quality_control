@@ -1,33 +1,3 @@
-"""Channel-quality data structures and (standalone) SCI/PSP scoring.
-
-As of the consolidation described below, channel quality control (SQI, SCI,
-PSP - any combination) is computed directly inside
-:class:`~fnirs_PFC_2025.processing.file_processor.FileProcessor`, using the
-:class:`ChannelQuality` / :class:`QualityReport` dataclasses defined here as
-the shared report structure. :class:`BatchProcessor` and
-:class:`PipelineManager` consume the ``QualityReport`` FileProcessor returns;
-neither runs its own separate quality prefilter anymore.
-
-:class:`ChannelQualityControl` (SCI/PSP-only, unconditional) is kept in this
-module for standalone/manual use, but is no longer wired into the default
-pipeline - FileProcessor's own quality logic supersedes it there.
-
-A channel is rejected if it fails *any* of its enabled metrics:
-
-* ``SQI < sqi_threshold``  (default 2.0, disabled by default)
-* ``SCI < sci_threshold``  (default 0.75)
-* ``PSP < psp_threshold``  (default 0.10)
-
-Short channels are retained by default even when they fail, because they are
-used as regressors rather than as signal (set ``exclude_failing_short_channels``
-to change this).
-
-Channel columns are expected to be named ``CH{n}_WL{wavelength}`` (OD) or
-``CH{n} HbO``/``CH{n} HbR`` (concentration). Channel indices are **zero-based**
-(``CH0``..``CH7``): the OctaMon short channels labelled 4 and 6 in 1-based
-optode numbering are ``CH3`` and ``CH5`` here.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -56,11 +26,6 @@ _CHANNEL_RE = re.compile(r"CH(\d+)_WL(\d+)", re.IGNORECASE)
 
 @dataclass(frozen=True)
 class ChannelQuality:
-    """Per-channel quality scores and verdict.
-
-    Any of ``sqi``/``sci``/``psp`` may be ``None`` if that metric wasn't
-    computed for this channel (i.e. it wasn't in the caller's enabled set).
-    """
 
     channel: int
     is_short: bool
@@ -85,6 +50,14 @@ class QualityReport:
     sqi_threshold: float = DEFAULT_SQI_THRESHOLD
     sci_threshold: float = DEFAULT_SCI_THRESHOLD
     psp_threshold: float = DEFAULT_PSP_THRESHOLD
+    # Set by FileProcessor._apply_scr when hemisphere-matched short-channel
+    # regression had to fall back to one short channel for both hemispheres,
+    # or skip SCR entirely because neither short channel genuinely passed
+    # quality. Empty string means SCR ran normally (each side corrected by
+    # its own short channel). This needs to be visible in the stats output,
+    # not just the logs, since it changes how the corrected long channels
+    # should be interpreted.
+    scr_note: str = ""
 
     @property
     def retained(self) -> List[ChannelQuality]:
@@ -107,13 +80,15 @@ class QualityReport:
         return sum(1 for c in self.retained if not c.is_short)
 
     def summary_line(self) -> str:
-        """One-line summary, e.g. '5 of 6 channels retained (long: 3/4)'."""
         metrics = "+".join(m.upper() for m in self.metrics_used) or "none"
-        return (f"{len(self.retained)} of {len(self.channels)} channels retained "
+        line = (f"{len(self.retained)} of {len(self.channels)} channels retained "
                 f"(long: {self.n_long_retained}/{self.n_long_total}) using {metrics}")
+        if self.scr_note:
+            line += f" | SCR: {self.scr_note}"
+        return line
 
     def to_dataframe(self) -> pd.DataFrame:
-        """Tabulate per-channel scores and verdicts."""
+
         return pd.DataFrame([
             {
                 "Channel": c.channel,
@@ -123,20 +98,13 @@ class QualityReport:
                 "PSP": c.psp,
                 "Passed": c.passed,
                 "Reason": c.reason_text,
+                "SCR Note": self.scr_note,
             }
             for c in self.channels
         ])
 
 
 class ChannelQualityControl:
-    """Score channels with SCI/PSP and decide which to keep.
-
-    Standalone SCI/PSP-only QC helper. NOT used by the default
-    FileProcessor/BatchProcessor/PipelineManager pipeline as of the
-    consolidation described in the module docstring - FileProcessor computes
-    quality (any combination of SQI/SCI/PSP) itself. Kept here for manual or
-    exploratory use.
-    """
 
     def __init__(
         self,
