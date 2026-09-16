@@ -6,15 +6,12 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Columns every processed grand-average CSV is expected to contain.
 _REQUIRED_COLUMNS = {"grand oxy", "grand deoxy", "Time (s)"}
 
-# Summary column order shared by the per-recording rows and the per-task sheets.
 _SUMMARY_COLUMNS = [
     "Subject", "Timepoint", "Condition", "TaskType",
     "Overall grand oxy Mean", "First Half grand oxy Mean", "Second Half grand oxy Mean",
@@ -23,19 +20,9 @@ _SUMMARY_COLUMNS = [
 
 
 class StatsCollector:
-    """Aggregate per-recording statistics into cross-subject, per-task tables."""
 
     def __init__(self, fs: float = 50.0, enable_quality_filtering: bool = True) -> None:
-        """
-        Args:
-            fs: Sampling frequency in Hz.
-            enable_quality_filtering: kept for parity with FileProcessor/
-                BatchProcessor/PipelineManager's constructor signatures and for
-                any future filtering-aware statistics; CSV lookup itself no
-                longer depends on this value (see module docstring) since it
-                globs for the processed CSV rather than reconstructing its
-                suffix.
-        """
+
         self.fs = fs
         self.enable_quality_filtering = enable_quality_filtering
 
@@ -113,12 +100,7 @@ class StatsCollector:
         output_dir: str,
         suffix: str = "",
     ) -> List[Path]:
-        """Write one cross-subject CSV per task, returning the written paths.
 
-        The task name is derived from each row's ``Condition`` by stripping the
-        per-subject prefix (``Turn_100_Walking_DT`` -> ``Walking_DT``), so rows
-        for the same task across subjects land in one file.
-        """
         if stats is None or stats.empty:
             logger.warning("No statistics to summarise (suffix=%r).", suffix)
             return []
@@ -143,39 +125,6 @@ class StatsCollector:
             logger.info("Wrote task summary (%d rows, %d subjects): %s",
                         len(task_df), task_df["Subject"].nunique(), path.name)
         return written
-
-    def calculate_subject_y_limits(
-        self,
-        processed_files: Sequence[str],
-        output_base_dir: str,
-        input_base_dir: str,
-    ) -> Dict[str, Dict[str, float]]:
-        """Pool each subject's RAW grand-average values to derive shared y-limits.
-
-        Uses robust 1st/99th percentiles with 10% padding so a single subject's
-        plots share a consistent y-axis across tasks.
-        """
-        pooled: Dict[str, List[float]] = {}
-        for file_path in processed_files:
-            csv_path = self._processed_csv_path(file_path, input_base_dir, output_base_dir, "RAW")
-            if csv_path is None:
-                continue
-            frame = self._read_processed_csv(csv_path)
-            if frame is None:
-                continue
-            subject, _ = self.extract_metadata(file_path)
-            values = pd.concat([frame["grand oxy"], frame["grand deoxy"]]).dropna()
-            pooled.setdefault(subject, []).extend(values.tolist())
-
-        limits: Dict[str, Dict[str, float]] = {}
-        for subject, values in pooled.items():
-            if not values:
-                continue
-            low, high = np.percentile(values, 1), np.percentile(values, 99)
-            pad = (high - low) * 0.1 or 0.1
-            limits[subject] = {"raw_min": float(low - pad), "raw_max": float(high + pad)}
-        logger.info("Derived y-limits for %d subject(s).", len(limits))
-        return limits
 
     # ----- path / metadata helpers --------------------------------------- #
     def extract_metadata(self, file_path: str) -> Tuple[str, str]:
@@ -211,7 +160,6 @@ class StatsCollector:
 
     @staticmethod
     def _match_embedded_timepoint(folder: str) -> Optional[Tuple[str, str]]:
-        """Split ``Subject_<timepoint>`` folder names (``_V1``, ``_Pre``, ``_T2``)."""
         patterns = (
             (r"^(.+?)_(V\d+)$", None),
             (r"^(.+?)_(T\d+)$", None),
@@ -245,7 +193,6 @@ class StatsCollector:
                 break
         return condition
 
-    # ----- internals ------------------------------------------------------ #
     def _processed_csv_path(
         self,
         file_path: str,
@@ -253,21 +200,8 @@ class StatsCollector:
         output_base_dir: str,
         file_type: str,
     ) -> Optional[Path]:
-        """Locate a recording's processed CSV as written by FileProcessor.
 
-        FileProcessor writes to a per-task sub-folder with a quality-filtering
-        suffix that depends on which metrics are enabled (e.g.
-        "_with_SCI_PSP_filtering", "_without_quality_filtering") - rather than
-        reconstruct that suffix here (duplicating FileProcessor's own
-        suffix-building logic, which has already changed once), we glob for the
-        file directly using `basename` and `file_type`, which are already
-        unique per recording without needing the suffix at all::
-
-            {output}/{relative}/{task}<suffix>/{basename}_FULLY_PROCESSED_{type}<suffix>.csv
-
-        e.g. ``DT_with_SCI_PSP_filtering/Turn_001_Walking_DT.txt_FULLY_PROCESSED_RAW_with_SCI_PSP_filtering.csv``
-        """
-        basename = os.path.basename(file_path)  # includes extension, as FileProcessor uses
+        basename = os.path.basename(file_path)  
         pattern = f"{basename}_FULLY_PROCESSED_{file_type}*.csv"
 
         relative = os.path.relpath(os.path.dirname(file_path), start=input_base_dir)
@@ -280,8 +214,6 @@ class StatsCollector:
                                    file_type, basename, matches[0].name)
                 return matches[0]
 
-        # Robust fallback: search the whole output tree in case the folder
-        # layout doesn't mirror the input tree exactly.
         matches = sorted(Path(output_base_dir).rglob(pattern))
         if matches:
             if len(matches) > 1:
@@ -290,28 +222,7 @@ class StatsCollector:
             return matches[0]
         return None
 
-    @staticmethod
-    def _determine_task_type(filename: str) -> str:
-        """Classify a recording by filename (mirrors FileProcessor's logic)."""
-        s = os.path.basename(filename).upper()
-        if "FTURN" in s or "F_TURN" in s:
-            return "fTurn"
-        if "LSHAPE" in s or "L_SHAPE" in s:
-            return "LShape"
-        if "OBSTACLE" in s:
-            return "Obstacle"
-        if "NAVIGATION" in s or re.search(r"\bNAV\b", s):
-            return "Navigation"
-        if re.search(r"(^|[^A-Z])DT([^A-Z]|$)", s):
-            return "DT"
-        if re.search(r"(^|[^A-Z])ST([^A-Z]|$)", s):
-            return "ST"
-        if "WALK" in s:
-            return "LongWalk"
-        return "Unknown"
-
     def _read_processed_csv(self, path: Path) -> Optional[pd.DataFrame]:
-        """Read and validate a processed CSV, or return ``None`` if unusable."""
         try:
             frame = pd.read_csv(path)
         except (OSError, pd.errors.ParserError) as exc:
@@ -329,7 +240,6 @@ class StatsCollector:
     def _summarise(
         self, frame: pd.DataFrame, subject: str, timepoint: str
     ) -> Optional[Dict[str, object]]:
-        """Compute overall and first/second-half means for one recording."""
         n = len(frame)
         half = n // 2
         condition = frame["Condition"].iloc[0] if "Condition" in frame.columns else "Unknown"
@@ -360,7 +270,6 @@ class StatsCollector:
 
     @staticmethod
     def _order_for_output(task_df: pd.DataFrame) -> pd.DataFrame:
-        """Select known columns in a fixed order and sort by subject/timepoint."""
         columns = [c for c in _SUMMARY_COLUMNS if c in task_df.columns]
         ordered = task_df[columns].copy()
         sort_cols = [c for c in ("Subject", "Timepoint") if c in ordered.columns]
