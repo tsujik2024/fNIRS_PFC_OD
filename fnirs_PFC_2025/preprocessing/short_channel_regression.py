@@ -4,10 +4,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Keyword groups used to detect a column's chromophore type, independent of
-# which pipeline's naming convention produced it. A column is oxygenated if
-# ANY of these substrings appear in its name, deoxygenated if any of the
-# other group's substrings appear.
 _OXY_KEYS = ("HbO", "O2Hb", "_oxy")
 _DEOXY_KEYS = ("HbR", "HHb", "_deoxy")
 
