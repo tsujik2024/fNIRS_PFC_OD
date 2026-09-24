@@ -9,8 +9,6 @@ import pandas as pd
 from fnirs_PFC_2025.preprocessing.average_channels import average_channels
 from fnirs_PFC_2025.preprocessing.baseline_correction import baseline_subtraction
 from fnirs_PFC_2025.preprocessing.butterworth_filter import butterworth_bandpass
-from fnirs_PFC_2025.preprocessing.sci import scalp_coupling_index
-from fnirs_PFC_2025.preprocessing.psp import peak_spectral_power
 from fnirs_PFC_2025.preprocessing.short_channel_regression import scr_regression
 from fnirs_PFC_2025.preprocessing.signalqualityindex import SQI
 from fnirs_PFC_2025.preprocessing.tddr import tddr
@@ -18,6 +16,7 @@ from fnirs_PFC_2025.preprocessing.z_transformation import z_transformation
 from fnirs_PFC_2025.processing.quality_control import (
     ChannelQuality, QualityReport,
     DEFAULT_SQI_THRESHOLD, DEFAULT_SCI_THRESHOLD, DEFAULT_PSP_THRESHOLD,
+    DEFAULT_MIN_GOOD_WINDOW_FRACTION, assess_channel,
 )
 from fnirs_PFC_2025.viz.plots import plot_channels_separately, plot_overall_signals
 
@@ -93,7 +92,9 @@ def _check(label, val, thr, digits):
 class FileProcessor:
     """One recording in, RAW (and optionally ZSCORE) grand-average CSVs out.
 
-    Quality metrics are computed on the pre-TDDR OD. post_walking_trim_seconds=0
+    Quality metrics are computed on the pre-TDDR OD, window by window: a 5 s window is good when
+    SCI and PSP both pass, and a channel is kept when at least min_good_window_fraction of its
+    windows are good (QT-NIRS rule). post_walking_trim_seconds=0
     starts the epoch at the walking-start marker; baseline and end rest are
     always cut.
     """
@@ -108,7 +109,8 @@ class FileProcessor:
                  post_walking_trim_seconds=3.0,
                  initial_crop_seconds=1.0,
                  skip_diagnostic_plots=False,
-                 compute_zscore=True):
+                 compute_zscore=True,
+                 min_good_window_fraction=DEFAULT_MIN_GOOD_WINDOW_FRACTION):
         self.fs = fs
         self.sqi_threshold = sqi_threshold
         self.sci_threshold = sci_threshold
@@ -125,6 +127,9 @@ class FileProcessor:
         self.initial_crop_seconds = initial_crop_seconds
         self.skip_diagnostic_plots = skip_diagnostic_plots
         self.compute_zscore = compute_zscore
+        if not 0.0 <= min_good_window_fraction <= 1.0:
+            raise ValueError("min_good_window_fraction must be between 0 and 1")
+        self.min_good_window_fraction = min_good_window_fraction
         self._name = ""
         self._window = None
         self._report = None
@@ -442,7 +447,8 @@ class FileProcessor:
     def _score_channels(self, data, groups, out_dir, conc):
         metrics = self.enabled_metrics
         report = QualityReport(metrics_used=metrics, sqi_threshold=self.sqi_threshold,
-                               sci_threshold=self.sci_threshold, psp_threshold=self.psp_threshold)
+                               sci_threshold=self.sci_threshold, psp_threshold=self.psp_threshold,
+                               min_good_window_fraction=self.min_good_window_fraction)
         excluded = []
 
         for ch, wls in groups.items():
@@ -451,7 +457,7 @@ class FileProcessor:
             cols = list(wls.values())
             od1 = data[cols[0]].to_numpy(dtype=float)
             od2 = data[cols[1]].to_numpy(dtype=float)
-            sqi = sci = psp = None
+            sqi = None
             why = []
 
             if 'sqi' in metrics:
@@ -459,21 +465,19 @@ class FileProcessor:
                 deoxy = conc[f"{ch} HbR"].to_numpy()
                 sqi = float(SQI(od1, od2, oxy, deoxy, self.fs))
                 why.append(_check('SQI', sqi, self.sqi_threshold, 2))
-            if 'sci' in metrics:
-                sci = scalp_coupling_index(od1, od2, self.fs)
-                why.append(_check('SCI', sci, self.sci_threshold, 3))
-            if 'psp' in metrics:
-                psp = peak_spectral_power(od1, od2, self.fs)
-                why.append(_check('PSP', psp, self.psp_threshold, 3))
-            why = [w for w in why if w]
+            sci, psp, good_frac, window_why = assess_channel(
+                od1, od2, self.fs, metrics=metrics,
+                sci_threshold=self.sci_threshold, psp_threshold=self.psp_threshold,
+                min_good_window_fraction=self.min_good_window_fraction)
+            why = [w for w in why if w] + window_why
 
             # short channels are only regressors, so keep them unless told otherwise
             spared = bool(why) and short and not self.exclude_failing_short_channels
             if spared:
                 why = ["short channel kept despite: " + "; ".join(why)]
             passed = spared or not why
-            report.channels.append(ChannelQuality(num, short, passed=passed, sqi=sqi, sci=sci,
-                                                  psp=psp, reasons=tuple(why)))
+            report.channels.append(ChannelQuality(num, short, passed=passed, sqi=sqi, sci=sci, psp=psp,
+                                                  reasons=tuple(why), good_window_fraction=good_frac))
 
             if why and not spared and self.enable_quality_filtering:
                 logger.warning("%s: excluding %s (%s)", self._name, ch, "; ".join(why))
