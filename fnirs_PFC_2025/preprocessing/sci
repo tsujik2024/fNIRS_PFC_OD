@@ -1,46 +1,80 @@
-"""Scalp Coupling Index (SCI).
-Reference:
-    Pollonini, L., Olds, C., Abaya, H., Bortfeld, H., Beauchamp, M. S., &
-    Oghalai, J. S. (2014). Auditory cortex activation to natural speech and
-    simulated cochlear implant speech measured with functional near-infrared
-    spectroscopy. Hearing Research, 309, 84-93.
+"""Scalp coupling index (SCI), PHOEBE style (Pollonini et al. 2016, Biomed Opt Express 7:5104).
+
+Band-pass both wavelengths to the cardiac band, cut into windows, and in each
+window take the zero-lag correlation of the two (std-normalized) signals.
+A channel's SCI is the median across windows.
+
+A flat window (no cardiac signal in one or both wavelengths) scores 0, the same
+way it does in PSP (psp.py), where a flat window has zero spectral power. It
+does NOT produce NaN: np.corrcoef on an all-zero window divides by zero, and a
+single NaN would turn the median across windows into NaN, rejecting a channel
+that is otherwise fine. A channel that is flat in every window therefore gets
+SCI = 0.0 and fails the threshold in the ordinary way; NaN is reserved for
+input that cannot be scored at all (non-finite samples, or a signal too short
+to filter).
+
+CARDIAC_BAND, WINDOW_S and cardiac_windows() are the shared basis for PSP too
+(psp.py imports them from here) and for processing/quality_control.py's
+default band -- one definition, so the two metrics can't drift out of sync
+with each other or with the class that scores against them.
 """
-
-from __future__ import annotations
-
 import numpy as np
-from scipy.signal import butter, filtfilt
+from scipy.signal import butter, sosfiltfilt
+
+CARDIAC_BAND = (0.5, 2.5)
+WINDOW_S = 5.0
 
 
-def scalp_coupling_index(
-    od_wl1: np.ndarray,
-    od_wl2: np.ndarray,
-    fs: float,
-    cardiac_band: tuple[float, float] = (0.5, 2.5),
-    filter_order: int = 4,
-) -> float:
-    
-    x1 = np.asarray(od_wl1, dtype=float).ravel()
-    x2 = np.asarray(od_wl2, dtype=float).ravel()
-    if x1.shape != x2.shape:
-        raise ValueError("Inputs must be the same length")
-    if not (np.all(np.isfinite(x1)) and np.all(np.isfinite(x2))):
-        return float("nan")
+def cardiac_windows(od1, od2, fs, band, window_s):
+    """Band-pass to `band`, cut into non-overlapping windows, normalize each.
 
-    nyq = fs / 2.0
-    low, high = cardiac_band
-    if not 0 < low < high < nyq:
-        raise ValueError(
-            f"Invalid cardiac band {cardiac_band} for fs={fs} (Nyquist={nyq})"
-        )
+    Returns a list of (n1, n2) window pairs (each already divided by its own
+    std), or None if the input has NaNs or is too short to filter. A flat
+    window (std ~ 0) is returned as all-zero, since there's no cardiac signal
+    to normalize.
+    """
+    x1 = np.asarray(od1, dtype=float)
+    x2 = np.asarray(od2, dtype=float)
+    if not (np.isfinite(x1).all() and np.isfinite(x2).all()):
+        return None
 
-    b, a = butter(filter_order, [low / nyq, high / nyq], btype="band")
-    f1 = filtfilt(b, a, x1)
-    f2 = filtfilt(b, a, x2)
+    sos = butter(4, band, btype='bandpass', fs=fs, output='sos')
+    try:
+        f1, f2 = sosfiltfilt(sos, x1), sosfiltfilt(sos, x2)
+    except ValueError:
+        return None
 
-    f1 -= f1.mean()
-    f2 -= f2.mean()
-    denom = float(np.sqrt(np.sum(f1 ** 2) * np.sum(f2 ** 2)))
-    if denom == 0:
-        return float("nan")
-    return float(np.sum(f1 * f2) / denom)
+    win = int(round(window_s * fs))
+    if not 2 <= win <= len(f1):
+        win = len(f1)
+
+    windows = []
+    for i in range(0, len(f1) - win + 1, win):
+        w1, w2 = f1[i:i + win], f2[i:i + win]
+        sd1, sd2 = w1.std(), w2.std()
+        if sd1 < 1e-12 or sd2 < 1e-12:
+            windows.append((np.zeros_like(w1), np.zeros_like(w2)))
+        else:
+            windows.append((w1 / sd1, w2 / sd2))
+    return windows
+
+
+def _window_correlation(n1, n2):
+    """Zero-lag correlation of one pair of normalized windows; 0.0 if either is flat.
+
+    cardiac_windows() returns an all-zero array for a flat window. Correlating
+    that would divide by zero (NaN plus a RuntimeWarning), so score it as 0:
+    no cardiac signal means no evidence of scalp coupling.
+    """
+    if not n1.any() or not n2.any():
+        return 0.0
+    r = float(np.corrcoef(n1, n2)[0, 1])
+    return r if np.isfinite(r) else 0.0
+
+
+def scalp_coupling_index(od1, od2, fs, band=CARDIAC_BAND, window_s=WINDOW_S):
+    windows = cardiac_windows(od1, od2, fs, band, window_s)
+    if not windows:
+        return float('nan')
+    scores = [_window_correlation(n1, n2) for n1, n2 in windows]
+    return float(np.median(scores))
