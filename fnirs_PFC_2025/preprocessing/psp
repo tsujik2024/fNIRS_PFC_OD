@@ -2,16 +2,7 @@
 
 Same windowing as SCI: band-pass to the cardiac band, cut into windows. In
 each window, cross-correlate the two (std-normalized) signals and take the
-peak of a Hamming periodogram of that cross-correlation. A channel's PSP = median across windows.
-
-Scaling: the periodogram is computed as a power spectral DENSITY
-(scaling='density', the default of scipy's periodogram and of MATLAB's), which
-is what the reference implementation in MNE-NIRS (mne_nirs.preprocessing.
-peak_power) uses, and is the scale its 0.1 threshold refers to. With this
-scaling and the default 5 s windows, a clean channel lands around 1.0-1.4 in
-synthetic tests and a channel with a barely visible pulse falls to roughly
-0.2 or below. The score grows with window length, so keep WINDOW_S fixed when
-comparing against the 0.1 threshold.
+peak of a Hamming periodogram of that cross-correlation. A channel's PSP = the median across windows.
 
 """
 import numpy as np
@@ -19,10 +10,10 @@ from scipy.signal import periodogram
 
 from fnirs_PFC_2025.preprocessing.sci import CARDIAC_BAND, WINDOW_S, cardiac_windows
 
-_SCALINGS = ('density', 'spectrum')
+_SCALINGS = ('spectrum', 'density')
 
 
-def peak_spectral_power(od1, od2, fs, band=CARDIAC_BAND, window_s=WINDOW_S, scaling='density'):
+def peak_spectral_power(od1, od2, fs, band=CARDIAC_BAND, window_s=WINDOW_S, scaling='spectrum'):
     if scaling not in _SCALINGS:
         raise ValueError(f"scaling must be one of {_SCALINGS}, got {scaling!r}")
     windows = cardiac_windows(od1, od2, fs, band, window_s)
