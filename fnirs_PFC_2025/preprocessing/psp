@@ -1,65 +1,36 @@
-"""Peak Spectral Power (PSP) — Pollonini/PHOEBE style.
-References:
-    Pollonini, L., et al. (2014). Auditory cortex activation to natural speech
-    and simulated cochlear implant speech measured with functional near-
-    infrared spectroscopy. Hearing Research, 309, 84-93.
+"""Peak spectral power (PSP), PHOEBE style (Pollonini et al. 2016, Biomed Opt Express 7:5104).
 
-    Pollonini, L., Bortfeld, H., & Oghalai, J. S. (2016). PHOEBE: a method
-    for real-time mapping of optodes-scalp coupling in functional near-
-    infrared spectroscopy. Biomedical Optics Express, 7(12), 5104-5119.
+Same windowing as SCI: band-pass to the cardiac band, cut into windows. In
+each window, cross-correlate the two (std-normalized) signals and take the
+peak of a Hamming periodogram of that cross-correlation. A channel's PSP = median across windows.
+
+Scaling: the periodogram is computed as a power spectral DENSITY
+(scaling='density', the default of scipy's periodogram and of MATLAB's), which
+is what the reference implementation in MNE-NIRS (mne_nirs.preprocessing.
+peak_power) uses, and is the scale its 0.1 threshold refers to. With this
+scaling and the default 5 s windows, a clean channel lands around 1.0-1.4 in
+synthetic tests and a channel with a barely visible pulse falls to roughly
+0.2 or below. The score grows with window length, so keep WINDOW_S fixed when
+comparing against the 0.1 threshold.
+
 """
-
-from __future__ import annotations
-
 import numpy as np
-from scipy.signal import csd
+from scipy.signal import periodogram
+
+from fnirs_PFC_2025.preprocessing.sci import CARDIAC_BAND, WINDOW_S, cardiac_windows
+
+_SCALINGS = ('density', 'spectrum')
 
 
-def _standardize(x: np.ndarray) -> np.ndarray | None:
-    sd = np.std(x)
-    if sd == 0 or not np.isfinite(sd):
-        return None
-    return (x - np.mean(x)) / sd
-
-
-def peak_spectral_power(
-    od_wl1: np.ndarray,
-    od_wl2: np.ndarray,
-    fs: float,
-    cardiac_band: tuple[float, float] = (0.5, 2.5),
-    nperseg: int | None = None,
-) -> float:
-
-    x1 = np.asarray(od_wl1, dtype=float).ravel()
-    x2 = np.asarray(od_wl2, dtype=float).ravel()
-    if x1.shape != x2.shape:
-        raise ValueError("Inputs must be the same length")
-    if x1.size == 0 or not (np.all(np.isfinite(x1)) and np.all(np.isfinite(x2))):
-        return float("nan")
-
-    nyq = fs / 2.0
-    low, high = cardiac_band
-    if not 0 < low < high < nyq:
-        raise ValueError(f"Invalid cardiac band {cardiac_band} for fs={fs} (Nyquist={nyq})")
-
-    z1 = _standardize(x1)
-    z2 = _standardize(x2)
-    if z1 is None or z2 is None:
-        return float("nan")
-
-    seg = nperseg if nperseg is not None else min(256, len(z1))
-    if seg < 8:
-        return float("nan")
-    freqs, pxy = csd(z1, z2, fs=fs, nperseg=seg)
-    mag = np.abs(pxy)
-
-    total = mag.sum()
-    if total == 0 or not np.isfinite(total):
-        return float("nan")
-    spec_norm = mag / total
-
-    in_band = (freqs >= cardiac_band[0]) & (freqs <= cardiac_band[1])
-    if not np.any(in_band):
-        return float("nan")
-
-    return float(spec_norm[in_band].max())
+def peak_spectral_power(od1, od2, fs, band=CARDIAC_BAND, window_s=WINDOW_S, scaling='density'):
+    if scaling not in _SCALINGS:
+        raise ValueError(f"scaling must be one of {_SCALINGS}, got {scaling!r}")
+    windows = cardiac_windows(od1, od2, fs, band, window_s)
+    if not windows:
+        return float('nan')
+    scores = []
+    for n1, n2 in windows:
+        xc = np.correlate(n1, n2, mode='full') / len(n1)
+        _, power = periodogram(xc, fs=fs, window='hamming', nfft=len(xc), scaling=scaling)
+        scores.append(power.max())
+    return float(np.median(scores))
