@@ -1,224 +1,83 @@
-from __future__ import annotations
-
 import logging
-import re
+import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import List, Optional
 
-import numpy as np
 import pandas as pd
 
-from fnirs_PFC_2025.preprocessing.psp import peak_spectral_power
-from fnirs_PFC_2025.preprocessing.sci import scalp_coupling_index
+from fnirs_PFC_2025.processing.batch_processor import BatchProcessor, BatchResult
+from fnirs_PFC_2025.processing.stats_collector import StatsCollector
 
 logger = logging.getLogger(__name__)
 
-# Literature defaults (Pollonini / PHOEBE) for SCI/PSP; SQI threshold is on a
-# 1-5 scale from FileProcessor's own SQI implementation.
-DEFAULT_SCI_THRESHOLD = 0.75
-DEFAULT_PSP_THRESHOLD = 0.10
-DEFAULT_SQI_THRESHOLD = 2.0
-DEFAULT_CARDIAC_BAND = (0.5, 2.5)
-DEFAULT_FILTER_ORDER = 4
-
-_CHANNEL_RE = re.compile(r"CH(\d+)_WL(\d+)", re.IGNORECASE)
-
-
-@dataclass(frozen=True)
-class ChannelQuality:
-
-    channel: int
-    is_short: bool
-    passed: bool
-    sqi: Optional[float] = None
-    sci: Optional[float] = None
-    psp: Optional[float] = None
-    reasons: Tuple[str, ...] = ()
-
-    @property
-    def reason_text(self) -> str:
-        """Human-readable verdict ("OK" when passed)."""
-        return "OK" if self.passed else "; ".join(self.reasons)
-
 
 @dataclass
-class QualityReport:
-    """Outcome of channel quality control for one recording."""
-
-    channels: List[ChannelQuality] = field(default_factory=list)
-    metrics_used: Tuple[str, ...] = ()
-    sqi_threshold: float = DEFAULT_SQI_THRESHOLD
-    sci_threshold: float = DEFAULT_SCI_THRESHOLD
-    psp_threshold: float = DEFAULT_PSP_THRESHOLD
-    # Set by FileProcessor._apply_scr when hemisphere-matched short-channel
-    # regression had to fall back to one short channel for both hemispheres,
-    # or skip SCR entirely because neither short channel genuinely passed
-    # quality. Empty string means SCR ran normally (each side corrected by
-    # its own short channel). This needs to be visible in the stats output,
-    # not just the logs, since it changes how the corrected long channels
-    # should be interpreted.
-    scr_note: str = ""
+class StudyResult:
+    batch: BatchResult
+    stats_raw: Optional[pd.DataFrame] = None
+    stats_zscore: Optional[pd.DataFrame] = None
+    summary_paths: List[Path] = field(default_factory=list)
+    qc_summary_path: Optional[Path] = None
 
     @property
-    def retained(self) -> List[ChannelQuality]:
-        return [c for c in self.channels if c.passed]
+    def total_files(self):
+        return self.batch.total_files
 
     @property
-    def rejected(self) -> List[ChannelQuality]:
-        return [c for c in self.channels if not c.passed]
-
-    @property
-    def retained_channels(self) -> List[int]:
-        return [c.channel for c in self.retained]
-
-    @property
-    def n_long_total(self) -> int:
-        return sum(1 for c in self.channels if not c.is_short)
-
-    @property
-    def n_long_retained(self) -> int:
-        return sum(1 for c in self.retained if not c.is_short)
-
-    def summary_line(self) -> str:
-        metrics = "+".join(m.upper() for m in self.metrics_used) or "none"
-        line = (f"{len(self.retained)} of {len(self.channels)} channels retained "
-                f"(long: {self.n_long_retained}/{self.n_long_total}) using {metrics}")
-        if self.scr_note:
-            line += f" | SCR: {self.scr_note}"
-        return line
-
-    def to_dataframe(self) -> pd.DataFrame:
-
-        return pd.DataFrame([
-            {
-                "Channel": c.channel,
-                "Short": c.is_short,
-                "SQI": c.sqi,
-                "SCI": c.sci,
-                "PSP": c.psp,
-                "Passed": c.passed,
-                "Reason": c.reason_text,
-                "SCR Note": self.scr_note,
-            }
-            for c in self.channels
-        ])
+    def n_processed(self):
+        return self.batch.n_processed
 
 
-class ChannelQualityControl:
+class PipelineManager:
+    """Process a study folder, then aggregate stats and write the QC roll-up.
 
-    def __init__(
-        self,
-        fs: float,
-        sci_threshold: float = DEFAULT_SCI_THRESHOLD,
-        psp_threshold: float = DEFAULT_PSP_THRESHOLD,
-        cardiac_band: Tuple[float, float] = DEFAULT_CARDIAC_BAND,
-        filter_order: int = DEFAULT_FILTER_ORDER,
-        short_channels: Sequence[int] = (3, 5),  # CH3, CH5 = OctaMon short channels 4 & 6 (0-based)
-        exclude_failing_short_channels: bool = False,
-        reject_on_nan: bool = True,
-    ) -> None:
-        self.fs = fs
-        self.sci_threshold = sci_threshold
-        self.psp_threshold = psp_threshold
-        self.cardiac_band = tuple(cardiac_band)
-        self.filter_order = filter_order
-        self.short_channels = set(short_channels)
-        self.exclude_failing_short_channels = exclude_failing_short_channels
-        self.reject_on_nan = reject_on_nan
+    Accepts the same keyword args as FileProcessor.
+    """
 
-    # ----- public API ----------------------------------------------------- #
-    def evaluate(self, data: pd.DataFrame) -> QualityReport:
-        """Score every channel found in ``data`` and return a report."""
-        channels = self._channel_wavelengths(data)
-        if not channels:
-            logger.warning("No 'CH{n}_WL{wl}' columns found for quality control.")
-            return QualityReport(metrics_used=("sci", "psp"),
-                                 sci_threshold=self.sci_threshold,
-                                 psp_threshold=self.psp_threshold)
+    def __init__(self, **processor_kwargs):
+        self._batch = BatchProcessor(**processor_kwargs)
+        self._stats = StatsCollector()
 
-        report = QualityReport(metrics_used=("sci", "psp"),
-                               sci_threshold=self.sci_threshold,
-                               psp_threshold=self.psp_threshold)
-        for channel in sorted(channels):
-            col1, col2 = channels[channel]
-            report.channels.append(
-                self._score_channel(channel, data[col1].to_numpy(), data[col2].to_numpy())
-            )
-        self._log(report)
-        return report
+    def discover_recordings(self, input_dir, task_filter=None):
+        return self._batch.find_input_files(input_dir, task_filter)
 
-    def apply(self, data: pd.DataFrame) -> Tuple[pd.DataFrame, QualityReport]:
-        """Evaluate quality and return ``(data_with_retained_channels, report)``.
-
-        Non-channel columns (metadata, events) are preserved; OD columns for
-        rejected channels are dropped.
-        """
-        report = self.evaluate(data)
-        keep_channels = set(report.retained_channels)
-        channel_cols = self._channel_wavelengths(data)
-
-        drop_cols: List[str] = []
-        for channel, (col1, col2) in channel_cols.items():
-            if channel not in keep_channels:
-                drop_cols.extend([col1, col2])
-
-        retained = data.drop(columns=drop_cols) if drop_cols else data.copy()
-        return retained, report
-
-    # ----- internals ------------------------------------------------------ #
-    def _score_channel(self, channel: int, wl1: np.ndarray, wl2: np.ndarray) -> ChannelQuality:
-        """Compute SCI/PSP for one channel and apply the pass/fail rules."""
-        is_short = channel in self.short_channels
-        sci = scalp_coupling_index(wl1, wl2, self.fs,
-                                   cardiac_band=self.cardiac_band,
-                                   filter_order=self.filter_order)
-        psp = peak_spectral_power(wl1, wl2, self.fs,
-                                  cardiac_band=self.cardiac_band,
-                                  filter_order=self.filter_order)
-
-        reasons: List[str] = []
-        if np.isnan(sci) or np.isnan(psp):
-            if self.reject_on_nan:
-                reasons.append("SCI/PSP could not be computed (NaN)")
+    def run(self, input_dir, output_dir, task_filter=None, show_progress=True):
+        os.makedirs(output_dir, exist_ok=True)
+        batch = self._batch.process(input_dir, output_dir, task_filter=task_filter,
+                                    show_progress=show_progress)
+        study = StudyResult(batch=batch)
+        if batch.processed_files:
+            study.stats_raw = self._aggregate(study, input_dir, output_dir, "RAW")
+            if self._batch.processor.compute_zscore:
+                study.stats_zscore = self._aggregate(study, input_dir, output_dir, "ZSCORE")
         else:
-            if sci < self.sci_threshold:
-                reasons.append(f"SCI {sci:.3f} < {self.sci_threshold:.2f}")
-            if psp < self.psp_threshold:
-                reasons.append(f"PSP {psp:.3f} < {self.psp_threshold:.2f}")
+            logger.warning("no recordings processed, skipping stats")
+        study.qc_summary_path = self._write_qc_summary(batch, output_dir)
+        return study
 
-        failed = bool(reasons)
-        if failed and is_short and not self.exclude_failing_short_channels:
-            # Short channel kept despite failing; record why it was spared.
-            return ChannelQuality(channel, True, passed=True, sci=sci, psp=psp,
-                                  reasons=("short channel kept despite: "
-                                           + "; ".join(reasons),))
-        return ChannelQuality(channel, is_short, passed=not failed, sci=sci, psp=psp,
-                              reasons=tuple(reasons))
+    def _aggregate(self, study, input_dir, output_dir, kind):
+        stats = self._stats.run_statistics(study.batch.processed_files, input_dir, output_dir, kind)
+        if stats is not None:
+            stats.to_csv(Path(output_dir) / f"all_subjects_statistics_{kind}.csv", index=False)
+        study.summary_paths += self._stats.create_summary_sheets(stats, output_dir, suffix=f"_{kind}")
+        return stats
 
-    def _channel_wavelengths(self, data: pd.DataFrame) -> Dict[int, Tuple[str, str]]:
-        """Map ``channel -> (wl1_col, wl2_col)`` from ``CH{n}_WL{wl}`` columns."""
-        by_channel: Dict[int, List[Tuple[int, str]]] = {}
-        for column in data.columns:
-            match = _CHANNEL_RE.fullmatch(str(column).strip())
-            if not match:
-                continue
-            channel, wavelength = int(match.group(1)), int(match.group(2))
-            by_channel.setdefault(channel, []).append((wavelength, column))
-
-        paired: Dict[int, Tuple[str, str]] = {}
-        for channel, entries in by_channel.items():
-            if len(entries) < 2:
-                logger.warning("Channel %d has %d wavelength column(s); skipping.",
-                               channel, len(entries))
-                continue
-            entries.sort()  # by wavelength ascending
-            paired[channel] = (entries[0][1], entries[1][1])
-        return paired
-
-    def _log(self, report: QualityReport) -> None:
-        """Log the summary and each rejection."""
-        logger.info("Channel QC: %s", report.summary_line())
-        for channel in report.rejected:
-            logger.warning("  REJECT CH%d  SCI=%.3f PSP=%.3f  (%s)",
-                           channel.channel, channel.sci, channel.psp,
-                           channel.reason_text)
+    @staticmethod
+    def _write_qc_summary(batch, output_dir):
+        """One row per recording; includes the SCR note so short-channel fallbacks show up study-wide."""
+        rows = [{
+            "Recording": os.path.splitext(os.path.basename(path))[0],
+            "Metrics used": "+".join(rep.metrics_used) or "none",
+            "Channels retained": len(rep.retained),
+            "Channels total": len(rep.channels),
+            "Long retained": rep.n_long_retained,
+            "Long total": rep.n_long_total,
+            "Rejected": ";".join(f"CH{c.channel}" for c in rep.rejected) or "-",
+            "SCR Note": rep.scr_note or "-",
+        } for path, rep in batch.qc_reports.items()]
+        if not rows:
+            return None
+        out = Path(output_dir) / "qc_summary_all_recordings.csv"
+        pd.DataFrame(rows).to_csv(out, index=False)
+        return out
