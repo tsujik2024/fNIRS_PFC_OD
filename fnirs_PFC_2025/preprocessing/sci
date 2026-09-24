@@ -2,21 +2,13 @@
 
 Band-pass both wavelengths to the cardiac band, cut into windows, and in each
 window take the zero-lag correlation of the two (std-normalized) signals.
-A channel's SCI is the median across windows.
+A channel's SCI = median across windows.
 
 A flat window (no cardiac signal in one or both wavelengths) scores 0, the same
-way it does in PSP (psp.py), where a flat window has zero spectral power. It
-does NOT produce NaN: np.corrcoef on an all-zero window divides by zero, and a
-single NaN would turn the median across windows into NaN, rejecting a channel
-that is otherwise fine. A channel that is flat in every window therefore gets
-SCI = 0.0 and fails the threshold in the ordinary way; NaN is reserved for
-input that cannot be scored at all (non-finite samples, or a signal too short
-to filter).
+way it does in PSP where a flat window has zero spectral power.
 
 CARDIAC_BAND, WINDOW_S and cardiac_windows() are the shared basis for PSP too
-(psp.py imports them from here) and for processing/quality_control.py's
-default band -- one definition, so the two metrics can't drift out of sync
-with each other or with the class that scores against them.
+nd for processing/quality_control.py's default 
 """
 import numpy as np
 from scipy.signal import butter, sosfiltfilt
