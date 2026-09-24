@@ -1,10 +1,21 @@
-"""
-Processing module for fNIRS data analysis.
-Contains classes and functions for file processing and statistics collection.
-"""
+from __future__ import annotations
 
-from .file_processor import FileProcessor
-from .stats_collector import StatsCollector
-from .pipeline_manager import PipelineManager
-from .batch_processor import BatchProcessor
-__all__ = ['FileProcessor', 'StatsCollector', 'PipelineManager', 'BatchProcessor']
+from fnirs_PFC_2025.processing.batch_processor import BatchProcessor, BatchResult
+from fnirs_PFC_2025.processing.pipeline_manager import PipelineManager, StudyResult
+from fnirs_PFC_2025.processing.quality_control import (
+    ChannelQuality,
+    ChannelQualityControl,
+    QualityReport,
+)
+from fnirs_PFC_2025.processing.stats_collector import StatsCollector
+
+__all__ = [
+    "BatchProcessor",
+    "BatchResult",
+    "PipelineManager",
+    "StudyResult",
+    "StatsCollector",
+    "ChannelQualityControl",
+    "QualityReport",
+    "ChannelQuality",
+]
