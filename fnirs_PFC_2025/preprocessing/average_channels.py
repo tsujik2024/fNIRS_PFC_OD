@@ -1,111 +1,89 @@
+import logging
 import re
-import pandas as pd
+
 import numpy as np
-from typing import Iterable, Optional, Dict, List
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+_CH_RE = re.compile(r'^CH(\d+)\s+(HbO|O2Hb|HHb|HbR)$')
+_OUT_COLS = ('left oxy', 'left deoxy', 'right oxy', 'right deoxy', 'grand oxy', 'grand deoxy')
 
 
-def average_channels(
-    df: pd.DataFrame,
-    channels_to_exclude: Optional[Iterable[int]] = None,
-    left_ids: Optional[Iterable[int]] = None,
-    right_ids: Optional[Iterable[int]] = None,
-    short_ids: Optional[Iterable[int]] = None,
-) -> pd.DataFrame:
-    
+def average_channels(df, channels_to_exclude=None, left_ids=None, right_ids=None, short_ids=None):
+    """Average CH{n} HbO/HbR into left/right/grand hemisphere means.
+
+    Short channels are always excluded -- they're SCR regressors, not signal.
+    If left_ids/right_ids/short_ids aren't given, the montage is guessed from
+    which channel numbers are present (see _infer_montage): pass them
+    explicitly whenever you know the montage, since the guess is genuinely
+    ambiguous in one case (see below).
+    """
     if not isinstance(df, pd.DataFrame):
-        raise TypeError(f"Must provide a DataFrame, not {type(df)}.")
+        raise TypeError(f"expected a DataFrame, got {type(df)}")
 
-    df_copy = df.copy()
-    ch_pat = re.compile(r'^CH(\d+)\s+(HbO|O2Hb|HHb|HbR)$')
+    present = {int(m.group(1)) for c in df.columns if (m := _CH_RE.match(str(c)))}
+    if not present:
+        logger.warning("no CH{n} HbO/HHb columns found, returning an all-NaN frame")
+        return _passthrough(df)
 
-    # Discover available channel indices
-    present_indices: set[int] = set()
-    for c in df_copy.columns:
-        m = ch_pat.match(str(c))
-        if m:
-            present_indices.add(int(m.group(1)))
+    if left_ids is None or right_ids is None or short_ids is None:
+        zero_based, why = _infer_montage(present)
+        logger.warning("montage not fully specified, inferred zero_based=%s (%s), present=%s",
+                       zero_based, why, sorted(present))
+        def_right, def_left, def_short = ([0, 1, 2], [4, 6, 7], [3, 5]) if zero_based \
+            else ([1, 2, 3], [5, 7, 8], [4, 6])
+        left_ids = def_left if left_ids is None else left_ids
+        right_ids = def_right if right_ids is None else right_ids
+        short_ids = def_short if short_ids is None else short_ids
 
-    if not present_indices:
-        # No fNIRS channels found; build a minimal passthrough
-        cols = {}
-        if 'Sample number' in df_copy: cols['Sample number'] = df_copy['Sample number']
-        if 'Event' in df_copy: cols['Event'] = df_copy['Event']
-        # Fill averages with NaN
-        nan_series = pd.Series(np.nan, index=df_copy.index)
-        cols.update({
-            'left oxy': nan_series, 'left deoxy': nan_series,
-            'right oxy': nan_series, 'right deoxy': nan_series,
-            'grand oxy': nan_series, 'grand deoxy': nan_series,
-        })
-        return pd.DataFrame(cols, index=df_copy.index)
+    exclude = set(channels_to_exclude or ()) | set(short_ids)
+    left = [i for i in left_ids if i in present and i not in exclude]
+    right = [i for i in right_ids if i in present and i not in exclude]
 
-    # Detect numbering scheme
-    zero_based = (0 in present_indices)  # True if CH0 exists
+    def cols(ids, chromo):
+        keys = ('HbO', 'O2Hb') if chromo == 'oxy' else ('HbR', 'HHb')
+        return [f'CH{i} {k}' for i in ids for k in keys if f'CH{i} {k}' in df.columns]
 
-    # Default hemisphere & short-channel maps (override if provided).
-    # From the montage table (1-based -> 0-based):
-    #   right = montage ch 1,2,3 ('R') = CH0,1,2
-    #   left  = montage ch 5,7,8 ('L') = CH4,6,7
-    #   short = montage ch 4,6         = CH3,5
-    # One-based is the same montage without the -1 shift.
-    if zero_based:
-        default_right, default_left, default_short = [0, 1, 2], [4, 6, 7], [3, 5]
-    else:
-        default_right, default_left, default_short = [1, 2, 3], [5, 7, 8], [4, 6]
+    def mean(cols):
+        return df[cols].mean(axis=1) if cols else pd.Series(np.nan, index=df.index)
 
-    left_ids  = default_left  if left_ids  is None else list(left_ids)
-    right_ids = default_right if right_ids is None else list(right_ids)
-    if short_ids is None:
-        short_ids = default_short
+    l_oxy, l_deoxy = cols(left, 'oxy'), cols(left, 'deoxy')
+    r_oxy, r_deoxy = cols(right, 'oxy'), cols(right, 'deoxy')
 
-    # Apply excludes
-    excludes = set(int(x) for x in (channels_to_exclude or [])) | set(int(x) for x in short_ids)
-    left_ids_eff  = [i for i in left_ids  if i in present_indices and i not in excludes]
-    right_ids_eff = [i for i in right_ids if i in present_indices and i not in excludes]
+    out = _meta_cols(df)
+    out['left oxy'], out['left deoxy'] = mean(l_oxy), mean(l_deoxy)
+    out['right oxy'], out['right deoxy'] = mean(r_oxy), mean(r_deoxy)
+    out['grand oxy'] = mean(l_oxy + r_oxy)
+    out['grand deoxy'] = mean(l_deoxy + r_deoxy)
+    return pd.DataFrame(out, index=df.index)
 
-    # Helper to collect existing column names for a set of channel ids
-    def cols_for(ids: Iterable[int], chromo: str) -> List[str]:
-        # Accept either 'HbO' or 'O2Hb' as oxy, and 'HbR' or 'HHb' as deoxy
-        names = []
-        targets = ('HbO', 'O2Hb') if chromo == 'oxy' else ('HbR', 'HHb')
-        for i in ids:
-            for t in targets:
-                col = f'CH{i} {t}'
-                if col in df_copy.columns:
-                    names.append(col)
-        return names
 
-    # Build column groups
-    left_hbo_cols  = cols_for(left_ids_eff,  'oxy')
-    left_hbr_cols  = cols_for(left_ids_eff,  'deoxy')
-    right_hbo_cols = cols_for(right_ids_eff, 'oxy')
-    right_hbr_cols = cols_for(right_ids_eff, 'deoxy')
+def _meta_cols(df):
+    out = {}
+    if 'Sample number' in df.columns:
+        out['Sample number'] = df['Sample number']
+    if 'Event' in df.columns:
+        out['Event'] = df['Event']
+    return out
 
-    # Compute means (broadcast NaN if empty)
-    def mean_or_nan(cols: List[str]) -> pd.Series:
-        return df_copy[cols].mean(axis=1) if cols else pd.Series(np.nan, index=df_copy.index)
 
-    left_oxy    = mean_or_nan(left_hbo_cols)
-    left_deoxy  = mean_or_nan(left_hbr_cols)
-    right_oxy   = mean_or_nan(right_hbo_cols)
-    right_deoxy = mean_or_nan(right_hbr_cols)
+def _passthrough(df):
+    out = _meta_cols(df)
+    nan = pd.Series(np.nan, index=df.index)
+    out.update({col: nan for col in _OUT_COLS})
+    return pd.DataFrame(out, index=df.index)
 
-    grand_oxy_cols   = left_hbo_cols  + right_hbo_cols
-    grand_deoxy_cols = left_hbr_cols  + right_hbr_cols
-    grand_oxy   = mean_or_nan(grand_oxy_cols)
-    grand_deoxy = mean_or_nan(grand_deoxy_cols)
 
-    # Build return frame
-    ret_cols: Dict[str, pd.Series] = {}
-    if 'Sample number' in df_copy.columns:
-        ret_cols['Sample number'] = df_copy['Sample number']
-    if 'Event' in df_copy.columns:
-        ret_cols['Event'] = df_copy['Event']
+def _infer_montage(present):
+    """CH0 only exists 0-based, CH8 only exists 1-based (8-channel device).
 
-    ret_cols.update({
-        'left oxy': left_oxy,   'left deoxy': left_deoxy,
-        'right oxy': right_oxy, 'right deoxy': right_deoxy,
-        'grand oxy': grand_oxy, 'grand deoxy': grand_deoxy,
-    })
-
-    return pd.DataFrame(ret_cols, index=df_copy.index)
+    If neither shows up -- ex QC dropped CH0 from an otherwise 0-based
+    recording, leaving CH1-CH7, which looks exactly like a 1-based montage --
+    default to 0-based rather than guess wrong
+    """
+    if 0 in present:
+        return True, "CH0 present"
+    if 8 in present:
+        return False, "CH8 present"
+    return True, "no CH0/CH8 present, defaulting to zero-based"
