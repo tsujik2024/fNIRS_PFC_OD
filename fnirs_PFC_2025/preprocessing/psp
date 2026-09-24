@@ -1,8 +1,8 @@
 """Peak spectral power (PSP), PHOEBE style (Pollonini et al. 2016, Biomed Opt Express 7:5104).
 
-Same windowing as SCI: band-pass to the cardiac band, cut into windows. In
-each window, cross-correlate the two (std-normalized) signals and take the
-peak of a Hamming periodogram of that cross-correlation. A channel's PSP = the median across windows.
+Same windowing as SCI: band-pass to the cardiac band, cut into windows. For each
+window, cross-correlate the two (std-normalized) signals and take the
+peak of a Hamming periodogram of that cross-correlation. Channel's PSP = the median across windows.
 
 """
 import numpy as np
@@ -13,15 +13,22 @@ from fnirs_PFC_2025.preprocessing.sci import CARDIAC_BAND, WINDOW_S, cardiac_win
 _SCALINGS = ('spectrum', 'density')
 
 
+def window_peak_powers(windows, fs, scaling='spectrum'):
+    """PSP of every window in a cardiac_windows() result, as an array."""
+    if scaling not in _SCALINGS:
+        raise ValueError(f"scaling must be one of {_SCALINGS}, got {scaling!r}")
+    scores = []
+    for n1, n2 in windows:
+        xc = np.correlate(n1, n2, mode='full') / len(n1)
+        _, power = periodogram(xc, fs=fs, window='hamming', nfft=len(xc), scaling=scaling)
+        scores.append(power.max())
+    return np.array(scores, dtype=float)
+
+
 def peak_spectral_power(od1, od2, fs, band=CARDIAC_BAND, window_s=WINDOW_S, scaling='spectrum'):
     if scaling not in _SCALINGS:
         raise ValueError(f"scaling must be one of {_SCALINGS}, got {scaling!r}")
     windows = cardiac_windows(od1, od2, fs, band, window_s)
     if not windows:
         return float('nan')
-    scores = []
-    for n1, n2 in windows:
-        xc = np.correlate(n1, n2, mode='full') / len(n1)
-        _, power = periodogram(xc, fs=fs, window='hamming', nfft=len(xc), scaling=scaling)
-        scores.append(power.max())
-    return float(np.median(scores))
+    return float(np.median(window_peak_powers(windows, fs, scaling)))
