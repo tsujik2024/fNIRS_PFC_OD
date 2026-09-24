@@ -1,83 +1,211 @@
 import logging
-import os
+import re
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
-from fnirs_PFC_2025.processing.batch_processor import BatchProcessor, BatchResult
-from fnirs_PFC_2025.processing.stats_collector import StatsCollector
+from fnirs_PFC_2025.preprocessing.psp import window_peak_powers
+from fnirs_PFC_2025.preprocessing.sci import CARDIAC_BAND, WINDOW_S, cardiac_windows, window_correlations
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_SCI_THRESHOLD = 0.75
+DEFAULT_PSP_THRESHOLD = 0.10
+DEFAULT_SQI_THRESHOLD = 2.0  # SQI is on a 1-5 scale
+# QT-NIRS rule a window is good when SCI and PSP both pass, and a
+# channel is kept when at least this fraction of its windows are good.
+DEFAULT_MIN_GOOD_WINDOW_FRACTION = 0.5 # default for QT-NIRS is 0.75, I changed to 0.5 to be more permissive
+DEFAULT_CARDIAC_BAND = CARDIAC_BAND  # single source: preprocessing/sci.py
+
+_CH_RE = re.compile(r"CH(\d+)_WL(\d+)", re.IGNORECASE)
+
+
+def assess_channel(od1, od2, fs, *, metrics=("sci", "psp"),
+                   sci_threshold=DEFAULT_SCI_THRESHOLD, psp_threshold=DEFAULT_PSP_THRESHOLD,
+                   min_good_window_fraction=DEFAULT_MIN_GOOD_WINDOW_FRACTION,
+                   band=DEFAULT_CARDIAC_BAND, window_s=WINDOW_S):
+    """Score one channel window by window.
+
+    A window is good when every enabled metric (SCI, PSP) meets its threshold; the channel passes
+    when the fraction of good windows is at least `min_good_window_fraction`. A single motion burst
+    therefore costs the channel one window, not the whole recording.
+
+    Returns (sci, psp, good_window_fraction, reasons). sci and psp are the medians across windows
+    (None for a metric that isn't enabled), kept for reporting. If the input can't be scored at all
+    (non-finite samples, or too short to filter), sci/psp are NaN, the fraction is None and reasons
+    holds a single "could not be computed" entry.
+    """
+    active = [m for m in ("sci", "psp") if m in {x.lower() for x in metrics}]
+    if not active:
+        return None, None, None, []
+
+    windows = cardiac_windows(od1, od2, fs, band, window_s)
+    if not windows:
+        return (np.nan if "sci" in active else None, np.nan if "psp" in active else None, None,
+                ["SCI/PSP could not be computed (NaN)"])
+
+    sci_w = window_correlations(windows)
+    psp_w = window_peak_powers(windows, fs)
+    good = np.ones(len(windows), dtype=bool)
+    criteria = []
+    if "sci" in active:
+        good &= sci_w >= sci_threshold
+        criteria.append(f"SCI>={sci_threshold:.2f}")
+    if "psp" in active:
+        good &= psp_w >= psp_threshold
+        criteria.append(f"PSP>={psp_threshold:.2f}")
+
+    fraction = float(good.mean())
+    reasons = []
+    if fraction < min_good_window_fraction:
+        reasons.append(f"only {fraction:.0%} of {len(windows)} {window_s:g}s windows passed "
+                       f"{' & '.join(criteria)} (need >= {min_good_window_fraction:.0%})")
+    return (float(np.median(sci_w)) if "sci" in active else None,
+            float(np.median(psp_w)) if "psp" in active else None,
+            fraction, reasons)
+
+
+@dataclass(frozen=True)
+class ChannelQuality:
+    channel: int
+    is_short: bool
+    passed: bool
+    sqi: Optional[float] = None
+    sci: Optional[float] = None
+    psp: Optional[float] = None
+    reasons: Tuple[str, ...] = ()
+    good_window_fraction: Optional[float] = None
+
+    @property
+    def reason_text(self):
+        return "OK" if self.passed else "; ".join(self.reasons)
+
 
 @dataclass
-class StudyResult:
-    batch: BatchResult
-    stats_raw: Optional[pd.DataFrame] = None
-    stats_zscore: Optional[pd.DataFrame] = None
-    summary_paths: List[Path] = field(default_factory=list)
-    qc_summary_path: Optional[Path] = None
+class QualityReport:
+    channels: List[ChannelQuality] = field(default_factory=list)
+    metrics_used: Tuple[str, ...] = ()
+    sqi_threshold: float = DEFAULT_SQI_THRESHOLD
+    sci_threshold: float = DEFAULT_SCI_THRESHOLD
+    psp_threshold: float = DEFAULT_PSP_THRESHOLD
+    min_good_window_fraction: float = DEFAULT_MIN_GOOD_WINDOW_FRACTION
+    # set when SCR had to borrow the other side's short channel or was skipped;
+    # it changes how the corrected long channels should be read, so it goes into the stats output
+    scr_note: str = ""
 
     @property
-    def total_files(self):
-        return self.batch.total_files
+    def retained(self):
+        return [c for c in self.channels if c.passed]
 
     @property
-    def n_processed(self):
-        return self.batch.n_processed
+    def rejected(self):
+        return [c for c in self.channels if not c.passed]
+
+    @property
+    def retained_channels(self):
+        return [c.channel for c in self.retained]
+
+    @property
+    def n_long_total(self):
+        return sum(not c.is_short for c in self.channels)
+
+    @property
+    def n_long_retained(self):
+        return sum(not c.is_short for c in self.retained)
+
+    def summary_line(self):
+        metrics = "+".join(m.upper() for m in self.metrics_used) or "none"
+        line = (f"{len(self.retained)} of {len(self.channels)} channels retained "
+                f"(long: {self.n_long_retained}/{self.n_long_total}) using {metrics}")
+        return f"{line} | SCR: {self.scr_note}" if self.scr_note else line
+
+    def to_dataframe(self):
+        return pd.DataFrame([
+            {"Channel": c.channel, "Short": c.is_short, "SQI": c.sqi, "SCI": c.sci, "PSP": c.psp,
+             "Good windows": c.good_window_fraction,
+             "Passed": c.passed, "Reason": c.reason_text, "SCR Note": self.scr_note}
+            for c in self.channels
+        ])
 
 
-class PipelineManager:
-    """Process a study folder, then aggregate stats and write the QC roll-up.
-
-    Accepts the same keyword args as FileProcessor.
+class ChannelQualityControl:
+    """Standalone SCI/PSP pass over a raw OD dataframe: finds CH{n}_WL{wl}
+    column pairs itself and scores each one with assess_channel(), the same rule
+    FileProcessor uses. This is the entry point for a quick QC check on a
+    dataframe from anywhere else (a notebook, a different loader, etc).
     """
 
-    def __init__(self, **processor_kwargs):
-        self._batch = BatchProcessor(**processor_kwargs)
-        self._stats = StatsCollector()
+    def __init__(self, fs, sci_threshold=DEFAULT_SCI_THRESHOLD, psp_threshold=DEFAULT_PSP_THRESHOLD,
+                 min_good_window_fraction=DEFAULT_MIN_GOOD_WINDOW_FRACTION,
+                 cardiac_band=DEFAULT_CARDIAC_BAND, window_s=WINDOW_S, short_channels=(3, 5),
+                 exclude_failing_short_channels=False, reject_on_nan=True):
+        self.fs = fs
+        self.sci_threshold = sci_threshold
+        self.psp_threshold = psp_threshold
+        self.min_good_window_fraction = min_good_window_fraction
+        self.cardiac_band = tuple(cardiac_band)
+        self.window_s = window_s
+        self.short_channels = set(short_channels)
+        self.exclude_failing_short_channels = exclude_failing_short_channels
+        self.reject_on_nan = reject_on_nan
 
-    def discover_recordings(self, input_dir, task_filter=None):
-        return self._batch.find_input_files(input_dir, task_filter)
+    def evaluate(self, data):
+        report = QualityReport(metrics_used=("sci", "psp"),
+                               sci_threshold=self.sci_threshold, psp_threshold=self.psp_threshold,
+                               min_good_window_fraction=self.min_good_window_fraction)
+        channels = self._channel_wavelengths(data)
+        if not channels:
+            logger.warning("no CH{n}_WL{wl} columns found for quality control")
+            return report
 
-    def run(self, input_dir, output_dir, task_filter=None, show_progress=True):
-        os.makedirs(output_dir, exist_ok=True)
-        batch = self._batch.process(input_dir, output_dir, task_filter=task_filter,
-                                    show_progress=show_progress)
-        study = StudyResult(batch=batch)
-        if batch.processed_files:
-            study.stats_raw = self._aggregate(study, input_dir, output_dir, "RAW")
-            if self._batch.processor.compute_zscore:
-                study.stats_zscore = self._aggregate(study, input_dir, output_dir, "ZSCORE")
-        else:
-            logger.warning("no recordings processed, skipping stats")
-        study.qc_summary_path = self._write_qc_summary(batch, output_dir)
-        return study
+        for channel, (col1, col2) in sorted(channels.items()):
+            report.channels.append(self._score(channel, data[col1].to_numpy(), data[col2].to_numpy()))
 
-    def _aggregate(self, study, input_dir, output_dir, kind):
-        stats = self._stats.run_statistics(study.batch.processed_files, input_dir, output_dir, kind)
-        if stats is not None:
-            stats.to_csv(Path(output_dir) / f"all_subjects_statistics_{kind}.csv", index=False)
-        study.summary_paths += self._stats.create_summary_sheets(stats, output_dir, suffix=f"_{kind}")
-        return stats
+        logger.info("channel QC: %s", report.summary_line())
+        for c in report.rejected:
+            logger.warning("reject CH%d (%s)", c.channel, c.reason_text)
+        return report
+
+    def apply(self, data):
+        report = self.evaluate(data)
+        keep = set(report.retained_channels)
+        drop_cols = [col for ch, cols in self._channel_wavelengths(data).items()
+                    if ch not in keep for col in cols]
+        return (data.drop(columns=drop_cols) if drop_cols else data.copy()), report
+
+    def _score(self, channel, wl1, wl2):
+        is_short = channel in self.short_channels
+        sci, psp, fraction, reasons = assess_channel(
+            wl1, wl2, self.fs, metrics=("sci", "psp"),
+            sci_threshold=self.sci_threshold, psp_threshold=self.psp_threshold,
+            min_good_window_fraction=self.min_good_window_fraction,
+            band=self.cardiac_band, window_s=self.window_s)
+        if fraction is None and not self.reject_on_nan:
+            reasons = []  # could not be scored at all, and the caller chose not to reject on that
+
+        failed = bool(reasons)
+        # short channels are SCR regressors, not signal -- spared by default
+        if failed and is_short and not self.exclude_failing_short_channels:
+            return ChannelQuality(channel, True, passed=True, sci=sci, psp=psp, good_window_fraction=fraction,
+                                  reasons=("short channel kept despite: " + "; ".join(reasons),))
+        return ChannelQuality(channel, is_short, passed=not failed, sci=sci, psp=psp,
+                              good_window_fraction=fraction, reasons=tuple(reasons))
 
     @staticmethod
-    def _write_qc_summary(batch, output_dir):
-        """One row per recording; includes the SCR note so short-channel fallbacks show up study-wide."""
-        rows = [{
-            "Recording": os.path.splitext(os.path.basename(path))[0],
-            "Metrics used": "+".join(rep.metrics_used) or "none",
-            "Channels retained": len(rep.retained),
-            "Channels total": len(rep.channels),
-            "Long retained": rep.n_long_retained,
-            "Long total": rep.n_long_total,
-            "Rejected": ";".join(f"CH{c.channel}" for c in rep.rejected) or "-",
-            "SCR Note": rep.scr_note or "-",
-        } for path, rep in batch.qc_reports.items()]
-        if not rows:
-            return None
-        out = Path(output_dir) / "qc_summary_all_recordings.csv"
-        pd.DataFrame(rows).to_csv(out, index=False)
-        return out
+    def _channel_wavelengths(data):
+        by_channel = {}
+        for col in data.columns:
+            m = _CH_RE.fullmatch(str(col).strip())
+            if m:
+                by_channel.setdefault(int(m.group(1)), []).append((int(m.group(2)), col))
+
+        paired = {}
+        for channel, entries in by_channel.items():
+            if len(entries) < 2:
+                logger.warning("channel %d has %d wavelength column(s), skipping", channel, len(entries))
+                continue
+            entries.sort()
+            paired[channel] = (entries[0][1], entries[1][1])
+        return paired
