@@ -7,7 +7,7 @@ A channel's SCI = median across windows.
 A flat window (no cardiac signal in one or both wavelengths) scores 0, the same
 way it does in PSP where a flat window has zero spectral power.
 
-CARDIAC_BAND, WINDOW_S and cardiac_windows() are the shared basis for PSP too
+CARDIAC_BAND, WINDOW_S and cardiac_windows() = shared basis for PSP too
 nd for processing/quality_control.py's default 
 """
 import numpy as np
@@ -64,9 +64,13 @@ def _window_correlation(n1, n2):
     return r if np.isfinite(r) else 0.0
 
 
+def window_correlations(windows):
+    """SCI of every window in a cardiac_windows() result, as an array."""
+    return np.array([_window_correlation(n1, n2) for n1, n2 in windows], dtype=float)
+
+
 def scalp_coupling_index(od1, od2, fs, band=CARDIAC_BAND, window_s=WINDOW_S):
     windows = cardiac_windows(od1, od2, fs, band, window_s)
     if not windows:
         return float('nan')
-    scores = [_window_correlation(n1, n2) for n1, n2 in windows]
-    return float(np.median(scores))
+    return float(np.median(window_correlations(windows)))
