@@ -6,8 +6,11 @@ A Python pipeline for preprocessing and analyzing functional Near-Infrared Spect
 ## Overview
 This package processes `.txt` fNIRS files exported from Octamon systems. It walks an input folder tree, groups recordings by task type, and runs each one through the pipeline. Steps include:
 
-- **Channel quality control (PHOEBE SCI/PSP, optional SQI)**
+- **Channel quality control (SCI/PSP,SQI)**
   Each channel is scored with the metrics you enable (`sci`, `psp`, `sqi`). By default, SCI and PSP are computed, and a channel that fails **any** enabled metric is excluded. Short channels that fail are "kept" by default, which means they stay included in the plots. It does **not** mean they are used for short-channel regression (see options below). Filtering can be turned off to score and report only.
+  Luca Pollonini, Heather Bortfeld, and John S. Oghalai, "PHOEBE: a method for real time mapping of optodes-scalp coupling in functional near-infrared spectroscopy," Biomed. Opt. Express 7, 5104-5119 (2016)
+  
+  Sappia MS, Hakimi N, Colier WNJM, Horschig JM. Signal quality index: an algorithm for quantitative assessment of functional near infrared spectroscopy signal quality. Biomed Opt Express. 2020 Oct 27;11(11):6732-6754. doi: 10.1364/BOE.409317. PMID: 33282521; PMCID: PMC7687963.
 - **Motion artifact correction (TDDR)**
   Fishburn, F.A., Ludlum, R.S., Vaidya, C.J., & Medvedev, A.V. (2019).
   *Temporal Derivative Distribution Repair (TDDR): A motion correction method for fNIRS.*
